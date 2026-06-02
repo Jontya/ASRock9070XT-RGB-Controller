@@ -101,15 +101,12 @@ def main():
         esc.hContext              = 0
 
         nts = gdi32.D3DKMTEscape(ctypes.byref(esc)) & 0xFFFFFFFF
-        ok = nts == 0
         print(f"  [{i}] hAdapter=0x{info.hAdapter:08X} "
               f"enumLUID={info.AdapterLuid.LowPart:#010x} "
-              f"→ 0x{nts:08X} {'OK' if ok else ''}")
-        if ok:
-            print("SUCCESS — LEDs should have changed.")
-            sys.exit(0)
+              f"→ 0x{nts:08X} {'OK' if nts==0 else ''}")
 
-    sys.exit(1)
+    print("Done — check which adapters returned OK and whether LEDs changed after each.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
