@@ -1,18 +1,25 @@
 """
 ADL diagnostic script — run via Windows Python (as Administrator) to verify setup.
-Exits 0 if ASRock RGB controller found and I2C probe succeeds, 1 otherwise.
+Phase 2: payload format probe. Watch for LED color changes to identify correct format.
+Exits 0 on success, 1 on failure.
 """
 
 import ctypes
 import os
 import sys
+import time
 
 DEFAULT_DLL = r"C:\Windows\System32\atiadlxx.dll"
 ADL_OK = 0
 ADL_MAX_PATH = 256
 ASROCK_SUBVENDOR = "1849"
-RGB_I2C_ADDR = 0x6C  # 8-bit form of 7-bit addr 0x36 (ADL expects pre-shifted)
 DISCRETE_DEV_IDS = {"7550"}
+
+# Confirmed from scan: ADL expects 8-bit (pre-shifted) address
+RGB_I2C_ADDR = 0x6C
+
+# Lines that responded in the previous scan
+CANDIDATE_LINES = [1, 3, 4, 5, 6, 7]
 
 
 class ADLAdapterInfo(ctypes.Structure):
@@ -56,142 +63,142 @@ def _malloc(size):
     return ctypes.cast(ctypes.create_string_buffer(size), ctypes.c_void_p).value
 
 
-def sep(char="-", n=60):
-    print(char * n)
-
-
-def i2c_write(adl, adapter: int, line: int, addr: int, offset: int, data: bytes) -> int:
-    buf = ctypes.create_string_buffer(data)
+def i2c_write(adl, adapter, line, addr, offset, data):
+    buf = ctypes.create_string_buffer(bytes(data))
     d = ADLI2CData()
     d.iSize     = ctypes.sizeof(ADLI2CData)
     d.iLine     = line
     d.iAddress  = addr
     d.iOffset   = offset
-    d.iAction   = 2       # WRITE
+    d.iAction   = 2
     d.iSpeed    = 100
     d.iDataSize = len(data)
     d.pcData    = ctypes.cast(buf, ctypes.c_char_p)
     return adl.ADL_Display_WriteAndReadI2C(adapter, ctypes.byref(d))
 
 
-def i2c_read(adl, adapter: int, line: int, addr: int, offset: int, length: int = 8) -> tuple:
-    buf = ctypes.create_string_buffer(length)
-    d = ADLI2CData()
-    d.iSize     = ctypes.sizeof(ADLI2CData)
-    d.iLine     = line
-    d.iAddress  = addr
-    d.iOffset   = offset
-    d.iAction   = 1       # READ
-    d.iSpeed    = 100
-    d.iDataSize = length
-    d.pcData    = ctypes.cast(buf, ctypes.c_char_p)
-    ret = adl.ADL_Display_WriteAndReadI2C(adapter, ctypes.byref(d))
-    return ret, buf.raw
+def sep(char="-", n=60):
+    print(char * n)
 
 
-def main():
-    dll_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DLL
+def load_adl(dll_path):
+    adl = ctypes.WinDLL(dll_path)
+    adl.ADL_Main_Control_Create(_malloc, 1)
+    return adl
 
-    print("ASRock RX 9070 XT RGB — ADL Diagnostic")
-    sep()
 
-    print(f"[1] Loading DLL: {dll_path}")
-    if not os.path.exists(dll_path):
-        print("    FAIL — file not found"); sys.exit(1)
-    try:
-        adl = ctypes.WinDLL(dll_path)
-        print("    OK")
-    except OSError as e:
-        print(f"    FAIL — {e}"); sys.exit(1)
-
-    print("[2] ADL_Main_Control_Create …")
-    if adl.ADL_Main_Control_Create(_malloc, 1) != ADL_OK:
-        print("    FAIL"); sys.exit(1)
-    print("    OK")
-
-    print("[3] Enumerating AMD adapters …")
+def get_discrete_adapter(adl):
     num = ctypes.c_int(0)
     adl.ADL_Adapter_NumberOfAdapters_Get(ctypes.byref(num))
-    count = num.value
-    print(f"    Adapter count: {count}")
-
-    if count == 0:
-        print("    No adapters"); adl.ADL_Main_Control_Destroy(); sys.exit(1)
-
-    InfoArray = ADLAdapterInfo * count
+    InfoArray = ADLAdapterInfo * num.value
     info_array = InfoArray()
     ctypes.memset(info_array, 0, ctypes.sizeof(info_array))
     adl.ADL_Adapter_AdapterInfo_Get(
         ctypes.cast(info_array, ctypes.POINTER(ADLAdapterInfo)),
         ctypes.sizeof(info_array),
     )
-
-    sep()
-    discrete = []
     for info in info_array:
         if not info.iPresent:
             continue
-        name = info.strAdapterName.decode(errors="replace")
-        pnp  = info.strPNPString.decode(errors="replace").upper()
-        dev  = next((p[4:8] for p in pnp.split("&") if p.startswith("DEV_")), "")
-        tag  = " *** ASRock ***" if ASROCK_SUBVENDOR in pnp else ""
-        print(f"  Adapter {info.iAdapterIndex:2d}: {name}  DEV={dev}{tag}")
+        pnp = info.strPNPString.decode(errors="replace").upper()
+        dev = next((p[4:8] for p in pnp.split("&") if p.startswith("DEV_")), "")
         if ASROCK_SUBVENDOR in pnp and dev in DISCRETE_DEV_IDS:
-            discrete.append(info.iAdapterIndex)
+            return info.iAdapterIndex
+    return None
 
+
+def main():
+    dll_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DLL
+
+    print("ASRock RX 9070 XT RGB — Payload Format Probe")
+    print("Watch your GPU LEDs for color changes during each test.")
     sep()
 
-    # Use only the first discrete adapter for scanning — they're all the same physical GPU
-    if not discrete:
-        print("No discrete ASRock adapter found — aborting")
-        adl.ADL_Main_Control_Destroy(); sys.exit(1)
-
-    scan_adapter = discrete[0]
-    print(f"[4] Scanning adapter {scan_adapter} — I2C bus line sweep (lines 0-15)")
-    print(f"    Address 0x{RGB_I2C_ADDR:02X}, offset 0x10, write [0x01,0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00]")
+    adl = load_adl(dll_path)
+    adapter = get_discrete_adapter(adl)
+    if adapter is None:
+        print("Discrete adapter not found"); sys.exit(1)
+    print(f"Using adapter {adapter}")
     sep()
 
-    hits = []
-    test_payload = bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00])
+    # -----------------------------------------------------------------------
+    # Payload format candidates (bright RED = 255,0,0 so changes are obvious)
+    # Each format is described + tested across all candidate lines.
+    # The first format that causes a visible LED change is correct.
+    # -----------------------------------------------------------------------
+    R, G, B = 255, 0, 0  # bright red — easy to see
 
-    for line in range(16):
-        ret = i2c_write(adl, scan_adapter, line, RGB_I2C_ADDR, 0x10, test_payload)
-        if ret == ADL_OK:
-            print(f"  Line {line:2d}: WRITE OK  *** controller may be here ***")
-            hits.append(line)
-        else:
-            # Also try read so we can distinguish "bus exists, no device" from "bus invalid"
-            rret, rdata = i2c_read(adl, scan_adapter, line, RGB_I2C_ADDR, 0x10)
-            if rret == ADL_OK:
-                print(f"  Line {line:2d}: READ  OK  data={rdata.hex(' ').upper()}  *** controller here ***")
-                hits.append(line)
-            else:
-                print(f"  Line {line:2d}: write ret={ret}  read ret={rret}")
+    formats = [
+        # (label, offset, data_fn)
+        # data_fn(channel) -> list of ints
+        (
+            "A: offset=0x10, data=[ch, mode, R, G, B, br, sp, dir]",
+            lambda ch: (0x10, [ch, 0x01, R, G, B, 0xFF, 0x00, 0x00]),
+        ),
+        (
+            "B: offset=0x00, data=[0x10, ch, mode, R, G, B, br, sp, dir]",
+            lambda ch: (0x00, [0x10, ch, 0x01, R, G, B, 0xFF, 0x00, 0x00]),
+        ),
+        (
+            "C: offset=ch, data=[mode, R, G, B, br, sp, dir, 0x00]  (original spec)",
+            lambda ch: (ch, [0x01, R, G, B, 0xFF, 0x00, 0x00, 0x00]),
+        ),
+        (
+            "D: offset=0x10, data=[mode, R, G, B, br, sp, dir, 0x00]  (no ch byte)",
+            lambda ch: (0x10, [0x01, R, G, B, 0xFF, 0x00, 0x00, 0x00]),
+        ),
+    ]
 
-    sep()
+    rgb_channels = [3, 6, 7]
 
-    # Also try alternate I2C address 0x6C (0x36 shifted left — some ADL variants expect 8-bit addr)
-    print(f"[5] Same scan with alternate address 0x6C (0x36 << 1) …")
-    sep()
-    for line in range(16):
-        ret = i2c_write(adl, scan_adapter, line, 0x6C, 0x10, test_payload)
-        if ret == ADL_OK:
-            print(f"  Line {line:2d} @ 0x6C: WRITE OK  *** try addr=0x6C ***")
-            hits.append(f"line={line},addr=0x6C")
+    for fmt_label, fmt_fn in formats:
+        print(f"\nFormat {fmt_label}")
+        input("  Press ENTER to send this format to all lines/channels, then watch LEDs …")
+        any_ok = False
+        for line in CANDIDATE_LINES:
+            for ch in rgb_channels:
+                offset, data = fmt_fn(ch)
+                ret = i2c_write(adl, adapter, line, RGB_I2C_ADDR, offset, data)
+                if ret == ADL_OK:
+                    any_ok = True
+            # brief pause between lines so a change is noticeable
+            time.sleep(0.1)
+        print(f"  Sent. Did LEDs change? (y/n): ", end="", flush=True)
+        ans = input().strip().lower()
+        if ans == "y":
+            print(f"\n  *** FORMAT CONFIRMED: {fmt_label} ***")
+            print(f"      Lines tried: {CANDIDATE_LINES}")
+            print(f"      Now running fine-grained line test to find exact bus …")
+            sep()
+            # Find which specific line triggers the change
+            colors = [(255,0,0), (0,255,0), (0,0,255)]
+            color_names = ["RED", "GREEN", "BLUE"]
+            for line in CANDIDATE_LINES:
+                c = colors[CANDIDATE_LINES.index(line) % 3]
+                cn = color_names[CANDIDATE_LINES.index(line) % 3]
+                for ch in rgb_channels:
+                    offset, data_tpl = fmt_fn(ch)
+                    # Replace R,G,B in data with current test color
+                    data = list(data_tpl)
+                    # Find and patch RGB bytes
+                    for i, v in enumerate(data):
+                        if v == R: data[i] = c[0]
+                        elif v == G and c[1] != R: data[i] = c[1]
+                    i2c_write(adl, adapter, line, RGB_I2C_ADDR, offset, data)
+                print(f"  Line {line}: sent {cn} to channels 3,6,7 — did a zone change? (y/n): ", end="", flush=True)
+                if input().strip().lower() == "y":
+                    print(f"      -> iLine={line} confirmed as active RGB bus")
+            sep("=")
+            print("RESULT: Protocol confirmed. Update adl_i2c.py with format and line above.")
+            adl.ADL_Main_Control_Destroy()
+            sys.exit(0)
 
     sep("=")
-    if hits:
-        print(f"RESULT: Responding lines: {hits}")
-        print("        Update RGB_I2C_ADDR / channel constants with these values.")
-    else:
-        print("RESULT: No I2C response on any line 0-15 at either address.")
-        print("        Possible causes:")
-        print("          - ADL_Display_WriteAndReadI2C not the right function for this driver")
-        print("          - I2C access requires a specific initialisation sequence first")
-        print("          - Try with a display connected to the GPU (some drivers gate I2C on active output)")
-
+    print("RESULT: No format caused visible LED change.")
+    print("        The I2C device at 0x6C may not be the RGB controller,")
+    print("        or the controller needs a different initialisation sequence.")
     adl.ADL_Main_Control_Destroy()
-    sys.exit(0 if hits else 1)
+    sys.exit(1)
 
 
 if __name__ == "__main__":
