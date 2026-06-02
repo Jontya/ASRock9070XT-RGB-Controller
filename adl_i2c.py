@@ -31,7 +31,8 @@ def _build_template() -> bytearray:
                           0x05, 0x00, 0x00, 0x00])
     # Offset 204: sub-structure sizes
     buf[204:212] = bytes([0x50, 0x01, 0x00, 0x00, 0x50, 0x01, 0x00, 0x00])
-    # Offset 212-219: LUID — patched per-adapter at runtime
+    # Offset 212-219: value from Polychrome capture (not a standard adapter LUID —
+    # AMD-internal identifier; patched at runtime from D3DKMTEnumAdapters if possible)
     # Offset 224: I2C command structure
     buf[224:252] = bytes([0x40, 0x01, 0x00, 0x00,  # struct size
                           0x04, 0x00, 0x00, 0x00,  # field
@@ -112,6 +113,12 @@ def _send_escape(r: int, g: int, b: int, verbose: bool = False) -> None:
         info = enum_data.Adapters[i]
 
         buf = bytearray(_TEMPLATE)
+        # Patch LUID at 212-219
+        # NOTE: Polychrome uses 0x0011002b here (captured). Not a standard adapter LUID.
+        # Using adapter LUID from enumeration as best guess; may need alternate source.
+        struct.pack_into("<II", buf, 212,
+                         info.AdapterLuid.LowPart,
+                         info.AdapterLuid.HighPart & 0xFFFFFFFF)
         # Patch RGB
         buf[255] = r & 0xFF
         buf[256] = g & 0xFF
@@ -128,7 +135,7 @@ def _send_escape(r: int, g: int, b: int, verbose: bool = False) -> None:
         esc.hAdapter              = info.hAdapter
         esc.hDevice               = 0
         esc.Type                  = 0   # D3DKMT_ESCAPE_DRIVERPRIVATE
-        esc.Flags                 = 1   # HardwareAccess bit required for I2C
+        esc.Flags                 = 0
         esc.pPrivateDriverData    = ctypes.cast(c_buf, ctypes.c_void_p)
         esc.PrivateDriverDataSize = _TEMPLATE_SIZE
         esc.hContext              = 0
