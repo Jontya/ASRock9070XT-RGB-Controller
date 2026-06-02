@@ -65,7 +65,8 @@ targets.forEach(({ mod, fn }) => {
 
 
 def find_polychrome():
-    for proc in frida.enumerate_processes():
+    device = frida.get_local_device()
+    for proc in device.enumerate_processes():
         if "polychrome" in proc.name.lower() or "asrpolychrome" in proc.name.lower():
             return proc
     return None
@@ -91,7 +92,8 @@ def main():
         sys.exit(1)
 
     print(f"Attaching to {proc.name} (pid {proc.pid}) …")
-    session = frida.attach(proc.pid)
+    device = frida.get_local_device()
+    session = device.attach(proc.pid)
     script = session.create_script(JS)
     script.on("message", on_message)
     script.load()
