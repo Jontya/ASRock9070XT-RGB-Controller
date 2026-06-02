@@ -112,14 +112,15 @@ def _send_escape(r: int, g: int, b: int, verbose: bool = False) -> None:
         info = enum_data.Adapters[i]
 
         buf = bytearray(_TEMPLATE)
-        # Patch LUID
-        struct.pack_into("<II", buf, 212,
-                         info.AdapterLuid.LowPart,
-                         info.AdapterLuid.HighPart & 0xFFFFFFFF)
         # Patch RGB
         buf[255] = r & 0xFF
         buf[256] = g & 0xFF
         buf[257] = b & 0xFF
+
+        if verbose:
+            print(f"[dbg] buf[0:16]   = {buf[0:16].hex()}")
+            print(f"[dbg] buf[72:92]  = {buf[72:92].hex()}")
+            print(f"[dbg] buf[204:264]= {buf[204:264].hex()}")
 
         c_buf = ctypes.create_string_buffer(bytes(buf))
 
