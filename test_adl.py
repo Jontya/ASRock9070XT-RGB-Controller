@@ -10,11 +10,13 @@ import sys
 DEFAULT_DLL = r"C:\Windows\System32\atiadlxx.dll"
 ADL_OK = 0
 ADL_MAX_PATH = 256
-ASROCK_SUBVENDOR = 0x1849
+ASROCK_SUBVENDOR = "1849"
 RGB_I2C_ADDR = 0x36
 
+# Known discrete GPU PCI device IDs for ASRock RX 9070 XT
+DISCRETE_DEV_IDS = {"7550"}
 
-# Windows-only ADLAdapterInfo layout (matches AMD ADL SDK adl_structures.h)
+
 class ADLAdapterInfo(ctypes.Structure):
     _fields_ = [
         ("iSize",            ctypes.c_int),
@@ -60,6 +62,37 @@ def sep(char="-", n=60):
     print(char * n)
 
 
+def pnp_dev_id(pnp: str) -> str:
+    """Extract DEV_xxxx value from PNP string."""
+    for part in pnp.upper().split("&"):
+        if part.startswith("DEV_"):
+            return part[4:8]
+    return ""
+
+
+def probe_i2c(adl, adapter_index: int, channel: int) -> tuple:
+    """Try read then write probe. Returns (ok: bool, detail: str)."""
+    for action, label in ((1, "READ"), (2, "WRITE")):
+        buf = ctypes.create_string_buffer(8)
+        if action == 2:
+            # Static white as test write — harmless
+            buf = ctypes.create_string_buffer(bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00]))
+        data = ADLI2CData()
+        data.iSize     = ctypes.sizeof(ADLI2CData)
+        data.iLine     = channel
+        data.iAddress  = RGB_I2C_ADDR
+        data.iOffset   = 0x10
+        data.iAction   = action
+        data.iSpeed    = 10
+        data.iDataSize = 8
+        data.pcData    = ctypes.cast(buf, ctypes.c_char_p)
+        ret = adl.ADL_Display_WriteAndReadI2C(adapter_index, ctypes.byref(data))
+        if ret == ADL_OK:
+            raw = buf.raw.hex(" ").upper()
+            return True, f"{label} OK — bytes: {raw}"
+    return False, f"ret={ret}"
+
+
 def main():
     dll_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DLL
 
@@ -101,87 +134,64 @@ def main():
     InfoArray = ADLAdapterInfo * count
     info_array = InfoArray()
     ctypes.memset(info_array, 0, ctypes.sizeof(info_array))
-
     adl.ADL_Adapter_AdapterInfo_Get(
         ctypes.cast(info_array, ctypes.POINTER(ADLAdapterInfo)),
         ctypes.sizeof(info_array),
     )
 
     sep()
-    asrock_index = None
+
+    # Collect all ASRock adapters; prefer discrete GPU (DEV_7550) over iGPU
+    discrete_matches = []
+    all_matches = []
+
     for info in info_array:
         if not info.iPresent:
             continue
         name = info.strAdapterName.decode(errors="replace")
         pnp  = info.strPNPString.decode(errors="replace")
+        dev  = pnp_dev_id(pnp)
+        is_asrock = ASROCK_SUBVENDOR in pnp.upper()
+        tag = " *** ASRock match ***" if is_asrock else ""
         print(f"  Adapter {info.iAdapterIndex:2d}: {name}")
-        print(f"             VendorID=0x{info.iVendorID:04X}  PNP={pnp[:60]}")
-
-        # Try SubSystem API
-        subvendor = None
-        try:
-            sv = ctypes.c_int(0)
-            ss = ctypes.c_int(0)
-            r = adl.ADL_Adapter_SubSystem_Get(info.iAdapterIndex, ctypes.byref(sv), ctypes.byref(ss))
-            if r == ADL_OK:
-                subvendor = sv.value
-                print(f"             SubVendorID=0x{subvendor:04X}  SubSystemID=0x{ss.value:04X}")
-        except AttributeError:
-            print("             ADL_Adapter_SubSystem_Get not in DLL")
-
-        is_asrock = (subvendor == ASROCK_SUBVENDOR) or (subvendor is None and "1849" in pnp)
-        if is_asrock and asrock_index is None:
-            asrock_index = info.iAdapterIndex
-            print(f"             *** ASRock match ***")
+        print(f"             DEV={dev}  PNP={pnp[:55]}{tag}")
+        if is_asrock:
+            all_matches.append(info.iAdapterIndex)
+            if dev in DISCRETE_DEV_IDS:
+                discrete_matches.append(info.iAdapterIndex)
 
     sep()
 
-    # Fallback: first present adapter
-    if asrock_index is None:
-        print("[!] ASRock adapter not positively identified — using first present adapter")
-        for info in info_array:
-            if info.iPresent:
-                asrock_index = info.iAdapterIndex
-                break
+    # Prefer discrete; fall back to any ASRock match; last resort: first present
+    candidate_pool = discrete_matches if discrete_matches else all_matches
+    if not candidate_pool:
+        print("[!] No ASRock adapters found — trying all present adapters")
+        candidate_pool = [i.iAdapterIndex for i in info_array if i.iPresent]
 
-    if asrock_index is None:
-        print("FAIL — no usable adapter found")
-        adl.ADL_Main_Control_Destroy()
-        sys.exit(1)
+    print(f"[4] Probing I2C (addr=0x{RGB_I2C_ADDR:02X}) on candidates: {candidate_pool}")
+    print(f"    {'discrete' if discrete_matches else 'all-asrock'} pool selected")
+    sep()
 
-    # 4. Probe I2C on channels 3, 6, 7
-    print(f"[4] Probing I2C on adapter {asrock_index} (channels 3, 6, 7) …")
-
-    found = False
-    for channel in [3, 6, 7]:
-        buf = ctypes.create_string_buffer(8)
-        data = ADLI2CData()
-        data.iSize    = ctypes.sizeof(ADLI2CData)
-        data.iLine    = channel
-        data.iAddress = RGB_I2C_ADDR
-        data.iOffset  = 0x10
-        data.iAction  = 1      # ADL_DL_I2C_ACTIONREAD
-        data.iSpeed   = 10
-        data.iDataSize = 8
-        data.pcData   = ctypes.cast(buf, ctypes.c_char_p)
-
-        ret = adl.ADL_Display_WriteAndReadI2C(asrock_index, ctypes.byref(data))
-        if ret == ADL_OK:
-            raw = buf.raw.hex(" ").upper()
-            print(f"    Channel {channel}: OK — bytes: {raw}")
-            found = True
-        else:
-            print(f"    Channel {channel}: ret={ret}")
+    found_adapter = None
+    for adapter_idx in candidate_pool:
+        print(f"  Adapter {adapter_idx}:")
+        for channel in [3, 6, 7]:
+            ok, detail = probe_i2c(adl, adapter_idx, channel)
+            status = "OK  " if ok else "FAIL"
+            print(f"    Channel {channel}: {status} — {detail}")
+            if ok and found_adapter is None:
+                found_adapter = adapter_idx
 
     sep("=")
-    if found:
-        print("RESULT: ASRock RGB controller FOUND — setup looks good.")
+    if found_adapter is not None:
+        print(f"RESULT: ASRock RGB controller FOUND on adapter {found_adapter}.")
+        print(f"        Use adapter_index={found_adapter} in config if needed.")
     else:
-        print("RESULT: I2C probe failed — controller not responding.")
-        print("        Check: run as Administrator, driver version, adapter index.")
+        print("RESULT: I2C probe failed on all candidates.")
+        print("        Check: run as Administrator, AMD driver version.")
 
     adl.ADL_Main_Control_Destroy()
-    sys.exit(0 if found else 1)
+    sys.exit(0 if found_adapter is not None else 1)
 
 
 if __name__ == "__main__":

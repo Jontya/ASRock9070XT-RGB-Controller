@@ -21,6 +21,9 @@ RGB_CMD = 0x10
 
 RGB_CHANNELS = [3, 6, 7]
 
+# PCI device IDs for discrete ASRock RX 9070 XT — prefer over iGPU adapters
+DISCRETE_DEV_IDS = {"7550"}
+
 DEFAULT_DLL_PATH = r"C:\Windows\System32\atiadlxx.dll"
 
 
@@ -145,29 +148,45 @@ class ASRockRGBController:
         if ret != ADL_OK:
             raise RuntimeError(f"ADL_Adapter_AdapterInfo_Get failed: {ret}")
 
-        # First pass: look for ASRock subvendor
-        try:
-            fn = self._adl.ADL_Adapter_SubSystem_Get
-            for info in info_array:
-                if not info.iPresent:
-                    continue
-                sv = ctypes.c_int(0)
-                ss = ctypes.c_int(0)
-                if fn(info.iAdapterIndex, ctypes.byref(sv), ctypes.byref(ss)) == ADL_OK:
-                    if sv.value == ASROCK_SUBVENDOR:
-                        return info.iAdapterIndex
-        except AttributeError:
-            pass
+        discrete_match = None
+        any_match = None
 
-        # Fallback: PNP string contains "1849" (subvendor in hardware ID)
         for info in info_array:
             if not info.iPresent:
                 continue
-            pnp = info.strPNPString.decode(errors="replace")
-            if "1849" in pnp:
-                return info.iAdapterIndex
+            pnp = info.strPNPString.decode(errors="replace").upper()
+            if "1849" not in pnp:
+                # Try ADL_Adapter_SubSystem_Get as secondary check
+                try:
+                    sv = ctypes.c_int(0)
+                    ss = ctypes.c_int(0)
+                    fn = self._adl.ADL_Adapter_SubSystem_Get
+                    if fn(info.iAdapterIndex, ctypes.byref(sv), ctypes.byref(ss)) == ADL_OK:
+                        if sv.value != ASROCK_SUBVENDOR:
+                            continue
+                    else:
+                        continue
+                except AttributeError:
+                    continue
 
-        # Last resort: first present adapter (single-GPU system)
+            # Prefer discrete GPU (DEV_7550) over iGPU
+            dev = ""
+            for part in pnp.split("&"):
+                if part.startswith("DEV_"):
+                    dev = part[4:8]
+                    break
+
+            if any_match is None:
+                any_match = info.iAdapterIndex
+            if discrete_match is None and dev in DISCRETE_DEV_IDS:
+                discrete_match = info.iAdapterIndex
+
+        if discrete_match is not None:
+            return discrete_match
+        if any_match is not None:
+            return any_match
+
+        # Last resort: first present adapter
         for info in info_array:
             if info.iPresent:
                 return info.iAdapterIndex
