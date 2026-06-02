@@ -14,6 +14,19 @@ import sys
 # D3DKMT_ESCAPE layout differs by pointer size.
 JS = """
 (function() {
+    // First: find which module actually exports D3DKMTEscape
+    const allMods = Process.enumerateModules();
+    allMods.forEach(function(m) {
+        try {
+            const exports = m.enumerateExports();
+            exports.forEach(function(e) {
+                if (e.name.indexOf("D3DKMT") !== -1 || e.name.indexOf("DdDDI") !== -1) {
+                    console.log("[scan] " + m.name + "!" + e.name + " @ " + e.address);
+                }
+            });
+        } catch(e) {}
+    });
+
     const is64 = Process.pointerSize === 8;
 
     // D3DKMT_ESCAPE offsets
