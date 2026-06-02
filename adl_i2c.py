@@ -95,7 +95,7 @@ class _D3DKMT_ESCAPE(ctypes.Structure):
 # Core: send escape to GPU
 # ---------------------------------------------------------------------------
 
-def _send_escape(r: int, g: int, b: int) -> None:
+def _send_escape(r: int, g: int, b: int, verbose: bool = False) -> None:
     """Send one D3DKMTEscape call per enumerated adapter until one succeeds."""
     gdi32 = ctypes.WinDLL("gdi32.dll")
 
@@ -103,6 +103,9 @@ def _send_escape(r: int, g: int, b: int) -> None:
     ret = gdi32.D3DKMTEnumAdapters(ctypes.byref(enum_data))
     if ret != 0:
         raise RuntimeError(f"D3DKMTEnumAdapters failed: 0x{ret & 0xFFFFFFFF:08X}")
+
+    if verbose:
+        print(f"[dbg] {enum_data.NumAdapters} adapters")
 
     last_ret = None
     for i in range(enum_data.NumAdapters):
@@ -130,6 +133,11 @@ def _send_escape(r: int, g: int, b: int) -> None:
         esc.hContext              = 0
 
         ret = gdi32.D3DKMTEscape(ctypes.byref(esc))
+        nts = ret & 0xFFFFFFFF
+        if verbose:
+            print(f"[dbg] adapter[{i}] hAdapter=0x{info.hAdapter:08X} "
+                  f"LUID={info.AdapterLuid.LowPart:#010x}:{info.AdapterLuid.HighPart:#010x} "
+                  f"→ NTSTATUS=0x{nts:08X}")
         if ret == 0:
             return  # STATUS_SUCCESS
         last_ret = ret
@@ -144,9 +152,10 @@ def _send_escape(r: int, g: int, b: int) -> None:
 # Public API (mirrors original adl_i2c interface)
 # ---------------------------------------------------------------------------
 
-def apply_color(r: int, g: int, b: int, dll_path: str = DEFAULT_DLL_PATH) -> None:
+def apply_color(r: int, g: int, b: int, dll_path: str = DEFAULT_DLL_PATH,
+                verbose: bool = False) -> None:
     """Apply static RGB color to all GPU LED zones. dll_path ignored (kept for compat)."""
-    _send_escape(r, g, b)
+    _send_escape(r, g, b, verbose=verbose)
 
 
 def load_config(config_path: str) -> dict:

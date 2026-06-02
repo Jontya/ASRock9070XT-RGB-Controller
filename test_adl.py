@@ -16,7 +16,7 @@ def main():
     print("ASRock RX 9070 XT — D3DKMTEscape RGB test")
     print("Setting LEDs to RED (255, 0, 0) …")
     try:
-        apply_color(255, 0, 0)
+        apply_color(255, 0, 0, verbose=True)
         print("OK — LEDs should now be red.")
         print("Run again with different values to test other colors:")
         print("  python test_adl.py 0 255 0   <- green")
@@ -31,7 +31,7 @@ if __name__ == "__main__":
         r, g, b = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
         print(f"Setting LEDs to RGB({r}, {g}, {b}) …")
         try:
-            apply_color(r, g, b)
+            apply_color(r, g, b, verbose=True)
             print("OK")
             sys.exit(0)
         except Exception as e:
