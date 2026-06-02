@@ -1,0 +1,13 @@
+# Project-specific
+config.json
+CLAUDE.md
+asrock_rgb_claude_prompt.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Windows
+Thumbs.db
+Desktop.ini
