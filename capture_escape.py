@@ -14,72 +14,50 @@ import sys
 # D3DKMT_ESCAPE layout differs by pointer size.
 JS = """
 (function() {
-    // First: find which module actually exports D3DKMTEscape
-    const allMods = Process.enumerateModules();
-    allMods.forEach(function(m) {
-        try {
-            const exports = m.enumerateExports();
-            exports.forEach(function(e) {
-                if (e.name.indexOf("D3DKMT") !== -1 || e.name.indexOf("DdDDI") !== -1) {
-                    console.log("[scan] " + m.name + "!" + e.name + " @ " + e.address);
-                }
-            });
-        } catch(e) {}
-    });
-
     const is64 = Process.pointerSize === 8;
-
-    // D3DKMT_ESCAPE offsets
-    // x64: hAdapter(8) hDevice(8) Type(4) Flags(4) pData(8) Size(4)
     // x86: hAdapter(4) hDevice(4) Type(4) Flags(4) pData(4) Size(4)
+    // x64: hAdapter(8) hDevice(8) Type(4) Flags(4) pData(8) Size(4)
     const OFF_TYPE  = is64 ? 0x10 : 0x08;
     const OFF_FLAGS = is64 ? 0x14 : 0x0C;
     const OFF_PDATA = is64 ? 0x18 : 0x10;
     const OFF_SIZE  = is64 ? 0x20 : 0x14;
 
-    const targets = [
-        ["gdi32.dll",     "D3DKMTEscape"],
-        ["gdi32full.dll", "D3DKMTEscape"],
-        ["win32u.dll",    "NtGdiDdDDIEscape"],
-    ];
-
+    const HOOK_NAMES = ["D3DKMTEscape", "NtGdiDdDDIEscape"];
     let hooked = 0;
-    targets.forEach(function(t) {
-        const mod = t[0], fn = t[1];
-        let addr = null;
-        try { addr = Module.findExportByName(mod, fn); } catch(e) {}
-        if (!addr) {
-            console.log("[-] Not found: " + mod + "!" + fn);
-            return;
-        }
+
+    Process.enumerateModules().forEach(function(m) {
         try {
-            Interceptor.attach(addr, {
-                onEnter: function(args) {
-                    try {
-                        const pEscape = args[0];
-                        const type  = pEscape.add(OFF_TYPE).readU32();
-                        const flags = pEscape.add(OFF_FLAGS).readU32();
-                        const pData = pEscape.add(OFF_PDATA).readPointer();
-                        const size  = pEscape.add(OFF_SIZE).readU32();
-                        if (size === 0 || size > 4096) return;
-                        const raw = pData.readByteArray(size);
-                        const hex = Array.from(new Uint8Array(raw))
-                            .map(function(b){ return b.toString(16).padStart(2,"0"); })
-                            .join(" ");
-                        send({ fn: fn, type: type, flags: flags, size: size, data: hex });
-                    } catch(e) {
-                        console.log("[!] onEnter error: " + e.message);
-                    }
+            m.enumerateExports().forEach(function(e) {
+                if (HOOK_NAMES.indexOf(e.name) === -1) return;
+                try {
+                    Interceptor.attach(e.address, {
+                        onEnter: function(args) {
+                            try {
+                                const pEscape = args[0];
+                                const type  = pEscape.add(OFF_TYPE).readU32();
+                                const flags = pEscape.add(OFF_FLAGS).readU32();
+                                const pData = pEscape.add(OFF_PDATA).readPointer();
+                                const size  = pEscape.add(OFF_SIZE).readU32();
+                                if (size === 0 || size > 4096) return;
+                                const raw = pData.readByteArray(size);
+                                const hex = Array.from(new Uint8Array(raw))
+                                    .map(function(b){ return b.toString(16).padStart(2,"0"); })
+                                    .join(" ");
+                                send({ fn: m.name + "!" + e.name, type: type, flags: flags, size: size, data: hex });
+                            } catch(ex) {}
+                        }
+                    });
+                    console.log("[+] Hooked " + m.name + "!" + e.name + " @ " + e.address);
+                    hooked++;
+                } catch(ex) {
+                    console.log("[!] Attach failed: " + m.name + "!" + e.name + " — " + ex.message);
                 }
             });
-            console.log("[+] Hooked " + mod + "!" + fn + " @ " + addr + " (arch=" + (is64?"x64":"x86") + ")");
-            hooked++;
-        } catch(e) {
-            console.log("[!] Attach failed for " + fn + ": " + e.message);
-        }
+        } catch(ex) {}
     });
+
     if (hooked === 0) {
-        console.log("[!] No hooks placed — D3DKMTEscape not found in any target DLL");
+        console.log("[!] No hooks placed");
     }
 })();
 """
