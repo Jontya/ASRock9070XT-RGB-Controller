@@ -11,7 +11,7 @@ DEFAULT_DLL = r"C:\Windows\System32\atiadlxx.dll"
 ADL_OK = 0
 ADL_MAX_PATH = 256
 ASROCK_SUBVENDOR = "1849"
-RGB_I2C_ADDR = 0x36
+RGB_I2C_ADDR = 0x6C  # 8-bit form of 7-bit addr 0x36 (ADL expects pre-shifted)
 DISCRETE_DEV_IDS = {"7550"}
 
 

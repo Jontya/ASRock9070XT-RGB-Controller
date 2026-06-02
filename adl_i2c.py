@@ -16,7 +16,7 @@ ADL_OK = 0
 ADL_MAX_PATH = 256
 
 ASROCK_SUBVENDOR = 0x1849
-RGB_I2C_ADDR = 0x36
+RGB_I2C_ADDR = 0x6C  # 8-bit form of 7-bit addr 0x36 (ADL expects pre-shifted)
 RGB_CMD = 0x10
 
 RGB_CHANNELS = [3, 6, 7]
