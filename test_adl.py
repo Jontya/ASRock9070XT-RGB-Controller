@@ -1,6 +1,6 @@
 """
-ADL diagnostic script — run via Windows Python to verify setup.
-Exits 0 if ASRock RGB controller found, 1 otherwise.
+ADL diagnostic script — run via Windows Python (as Administrator) to verify setup.
+Exits 0 if ASRock RGB controller found and I2C probe succeeds, 1 otherwise.
 """
 
 import ctypes
@@ -14,26 +14,24 @@ ASROCK_SUBVENDOR = 0x1849
 RGB_I2C_ADDR = 0x36
 
 
+# Windows-only ADLAdapterInfo layout (matches AMD ADL SDK adl_structures.h)
 class ADLAdapterInfo(ctypes.Structure):
     _fields_ = [
-        ("iSize",           ctypes.c_int),
-        ("iAdapterIndex",   ctypes.c_int),
-        ("strUDID",         ctypes.c_char * ADL_MAX_PATH),
-        ("iBusNumber",      ctypes.c_int),
-        ("iDeviceNumber",   ctypes.c_int),
-        ("iFunctionNumber", ctypes.c_int),
-        ("iVendorID",       ctypes.c_int),
-        ("strAdapterName",  ctypes.c_char * ADL_MAX_PATH),
-        ("strDisplayName",  ctypes.c_char * ADL_MAX_PATH),
-        ("iPresent",        ctypes.c_int),
-        ("iXScreenNum",     ctypes.c_int),
-        ("iOSDisplayIndex", ctypes.c_int),
-        ("strXScreenConfigName", ctypes.c_char * ADL_MAX_PATH),
-        ("iExist",          ctypes.c_int),
-        ("strDriverPath",   ctypes.c_char * ADL_MAX_PATH),
-        ("strDriverPathExt",ctypes.c_char * ADL_MAX_PATH),
-        ("strPNPString",    ctypes.c_char * ADL_MAX_PATH),
-        ("iOSDisplayIndex2",ctypes.c_int),
+        ("iSize",            ctypes.c_int),
+        ("iAdapterIndex",    ctypes.c_int),
+        ("strUDID",          ctypes.c_char * ADL_MAX_PATH),
+        ("iBusNumber",       ctypes.c_int),
+        ("iDeviceNumber",    ctypes.c_int),
+        ("iFunctionNumber",  ctypes.c_int),
+        ("iVendorID",        ctypes.c_int),
+        ("strAdapterName",   ctypes.c_char * ADL_MAX_PATH),
+        ("strDisplayName",   ctypes.c_char * ADL_MAX_PATH),
+        ("iPresent",         ctypes.c_int),
+        ("iExist",           ctypes.c_int),
+        ("strDriverPath",    ctypes.c_char * ADL_MAX_PATH),
+        ("strDriverPathExt", ctypes.c_char * ADL_MAX_PATH),
+        ("strPNPString",     ctypes.c_char * ADL_MAX_PATH),
+        ("iOSDisplayIndex",  ctypes.c_int),
     ]
 
 
@@ -65,13 +63,13 @@ def sep(char="-", n=60):
 def main():
     dll_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DLL
 
-    print(f"ASRock RX 9070 XT RGB — ADL Diagnostic")
+    print("ASRock RX 9070 XT RGB — ADL Diagnostic")
     sep()
 
     # 1. Load DLL
     print(f"[1] Loading DLL: {dll_path}")
     if not os.path.exists(dll_path):
-        print(f"    FAIL — file not found")
+        print("    FAIL — file not found")
         sys.exit(1)
     try:
         adl = ctypes.WinDLL(dll_path)
@@ -103,7 +101,7 @@ def main():
     InfoArray = ADLAdapterInfo * count
     info_array = InfoArray()
     ctypes.memset(info_array, 0, ctypes.sizeof(info_array))
-    info_array[0].iSize = ctypes.sizeof(ADLAdapterInfo)
+
     adl.ADL_Adapter_AdapterInfo_Get(
         ctypes.cast(info_array, ctypes.POINTER(ADLAdapterInfo)),
         ctypes.sizeof(info_array),
@@ -115,10 +113,12 @@ def main():
         if not info.iPresent:
             continue
         name = info.strAdapterName.decode(errors="replace")
-        print(f"  Adapter {info.iAdapterIndex:2d}: {name} (VendorID=0x{info.iVendorID:04X}, present={info.iPresent})")
+        pnp  = info.strPNPString.decode(errors="replace")
+        print(f"  Adapter {info.iAdapterIndex:2d}: {name}")
+        print(f"             VendorID=0x{info.iVendorID:04X}  PNP={pnp[:60]}")
 
-        # Check SubVendor
-        subvendor = 0
+        # Try SubSystem API
+        subvendor = None
         try:
             sv = ctypes.c_int(0)
             ss = ctypes.c_int(0)
@@ -127,56 +127,58 @@ def main():
                 subvendor = sv.value
                 print(f"             SubVendorID=0x{subvendor:04X}  SubSystemID=0x{ss.value:04X}")
         except AttributeError:
-            print("             ADL_Adapter_SubSystem_Get not available — skipping SubVendor check")
-            subvendor = ASROCK_SUBVENDOR  # assume on single-GPU system
+            print("             ADL_Adapter_SubSystem_Get not in DLL")
 
-        if subvendor == ASROCK_SUBVENDOR and asrock_index is None:
+        is_asrock = (subvendor == ASROCK_SUBVENDOR) or (subvendor is None and "1849" in pnp)
+        if is_asrock and asrock_index is None:
             asrock_index = info.iAdapterIndex
-            print(f"             *** ASRock SubVendor match (0x{ASROCK_SUBVENDOR:04X}) ***")
+            print(f"             *** ASRock match ***")
 
     sep()
 
-    # 4. Probe I2C
+    # Fallback: first present adapter
     if asrock_index is None:
-        print("[4] ASRock adapter not identified — trying adapter 0 as fallback")
-        asrock_index = 0
+        print("[!] ASRock adapter not positively identified — using first present adapter")
+        for info in info_array:
+            if info.iPresent:
+                asrock_index = info.iAdapterIndex
+                break
 
-    print(f"[4] Probing I2C address 0x{RGB_I2C_ADDR:02X} on adapter {asrock_index} …")
-    buf = ctypes.create_string_buffer(8)
-    data = ADLI2CData()
-    data.iSize = ctypes.sizeof(ADLI2CData)
-    data.iLine = 3          # Channel 3 (ARGB header)
-    data.iAddress = RGB_I2C_ADDR
-    data.iOffset = 0x10
-    data.iAction = 1        # ADL_DL_I2C_ACTIONREAD
-    data.iSpeed = 10
-    data.iDataSize = 8
-    data.pcData = ctypes.cast(buf, ctypes.c_char_p)
+    if asrock_index is None:
+        print("FAIL — no usable adapter found")
+        adl.ADL_Main_Control_Destroy()
+        sys.exit(1)
+
+    # 4. Probe I2C on channels 3, 6, 7
+    print(f"[4] Probing I2C on adapter {asrock_index} (channels 3, 6, 7) …")
 
     found = False
-    for fn_name in ("ADL2_Display_WriteAndReadI2CRev_Get", "ADL_Display_WriteAndReadI2C"):
-        try:
-            fn = getattr(adl, fn_name)
-            if "ADL2" in fn_name:
-                ret = fn(None, asrock_index, ctypes.byref(data))
-            else:
-                ret = fn(asrock_index, ctypes.byref(data))
-            if ret == ADL_OK:
-                raw = buf.raw.hex(" ").upper()
-                print(f"    {fn_name} OK — response bytes: {raw}")
-                found = True
-                break
-            else:
-                print(f"    {fn_name} ret={ret}")
-        except AttributeError:
-            print(f"    {fn_name} not in DLL")
+    for channel in [3, 6, 7]:
+        buf = ctypes.create_string_buffer(8)
+        data = ADLI2CData()
+        data.iSize    = ctypes.sizeof(ADLI2CData)
+        data.iLine    = channel
+        data.iAddress = RGB_I2C_ADDR
+        data.iOffset  = 0x10
+        data.iAction  = 1      # ADL_DL_I2C_ACTIONREAD
+        data.iSpeed   = 10
+        data.iDataSize = 8
+        data.pcData   = ctypes.cast(buf, ctypes.c_char_p)
+
+        ret = adl.ADL_Display_WriteAndReadI2C(asrock_index, ctypes.byref(data))
+        if ret == ADL_OK:
+            raw = buf.raw.hex(" ").upper()
+            print(f"    Channel {channel}: OK — bytes: {raw}")
+            found = True
+        else:
+            print(f"    Channel {channel}: ret={ret}")
 
     sep("=")
     if found:
         print("RESULT: ASRock RGB controller FOUND — setup looks good.")
     else:
         print("RESULT: I2C probe failed — controller not responding.")
-        print("        Check: driver version, adapter index, run as Administrator.")
+        print("        Check: run as Administrator, driver version, adapter index.")
 
     adl.ADL_Main_Control_Destroy()
     sys.exit(0 if found else 1)

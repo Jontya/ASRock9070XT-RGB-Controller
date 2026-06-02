@@ -4,7 +4,6 @@ Calls atiadlxx.dll via ctypes. No third-party dependencies.
 """
 
 import ctypes
-import ctypes.wintypes as wintypes
 import json
 import os
 import sys
@@ -20,50 +19,45 @@ ASROCK_SUBVENDOR = 0x1849
 RGB_I2C_ADDR = 0x36
 RGB_CMD = 0x10
 
-# Channels to write
 RGB_CHANNELS = [3, 6, 7]
 
-# Default DLL path
 DEFAULT_DLL_PATH = r"C:\Windows\System32\atiadlxx.dll"
 
 
 # ---------------------------------------------------------------------------
-# ADL structures
+# ADL structures — Windows layout only
 # ---------------------------------------------------------------------------
 
 class ADLAdapterInfo(ctypes.Structure):
     _fields_ = [
-        ("iSize",           ctypes.c_int),
-        ("iAdapterIndex",   ctypes.c_int),
-        ("strUDID",         ctypes.c_char * ADL_MAX_PATH),
-        ("iBusNumber",      ctypes.c_int),
-        ("iDeviceNumber",   ctypes.c_int),
-        ("iFunctionNumber", ctypes.c_int),
-        ("iVendorID",       ctypes.c_int),
-        ("strAdapterName",  ctypes.c_char * ADL_MAX_PATH),
-        ("strDisplayName",  ctypes.c_char * ADL_MAX_PATH),
-        ("iPresent",        ctypes.c_int),
-        ("iXScreenNum",     ctypes.c_int),
-        ("iOSDisplayIndex", ctypes.c_int),
-        ("strXScreenConfigName", ctypes.c_char * ADL_MAX_PATH),
-        ("iExist",          ctypes.c_int),
-        ("strDriverPath",   ctypes.c_char * ADL_MAX_PATH),
-        ("strDriverPathExt",ctypes.c_char * ADL_MAX_PATH),
-        ("strPNPString",    ctypes.c_char * ADL_MAX_PATH),
-        ("iOSDisplayIndex2",ctypes.c_int),
+        ("iSize",            ctypes.c_int),
+        ("iAdapterIndex",    ctypes.c_int),
+        ("strUDID",          ctypes.c_char * ADL_MAX_PATH),
+        ("iBusNumber",       ctypes.c_int),
+        ("iDeviceNumber",    ctypes.c_int),
+        ("iFunctionNumber",  ctypes.c_int),
+        ("iVendorID",        ctypes.c_int),
+        ("strAdapterName",   ctypes.c_char * ADL_MAX_PATH),
+        ("strDisplayName",   ctypes.c_char * ADL_MAX_PATH),
+        ("iPresent",         ctypes.c_int),
+        ("iExist",           ctypes.c_int),
+        ("strDriverPath",    ctypes.c_char * ADL_MAX_PATH),
+        ("strDriverPathExt", ctypes.c_char * ADL_MAX_PATH),
+        ("strPNPString",     ctypes.c_char * ADL_MAX_PATH),
+        ("iOSDisplayIndex",  ctypes.c_int),
     ]
 
 
 class ADLI2CData(ctypes.Structure):
     _fields_ = [
-        ("iSize",           ctypes.c_int),
-        ("iLine",           ctypes.c_int),
-        ("iAddress",        ctypes.c_int),
-        ("iOffset",         ctypes.c_int),
-        ("iAction",         ctypes.c_int),
-        ("iSpeed",          ctypes.c_int),
-        ("iDataSize",       ctypes.c_int),
-        ("pcData",          ctypes.c_char_p),
+        ("iSize",     ctypes.c_int),
+        ("iLine",     ctypes.c_int),
+        ("iAddress",  ctypes.c_int),
+        ("iOffset",   ctypes.c_int),
+        ("iAction",   ctypes.c_int),
+        ("iSpeed",    ctypes.c_int),
+        ("iDataSize", ctypes.c_int),
+        ("pcData",    ctypes.c_char_p),
     ]
 
 
@@ -91,26 +85,21 @@ class ASRockRGBController:
         self._adl = None
         self._adapter_index = None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def open(self) -> None:
-        """Load DLL, initialise ADL, find ASRock adapter."""
         if not os.path.exists(self._dll_path):
             raise FileNotFoundError(f"ADL DLL not found: {self._dll_path}")
-
         try:
             self._adl = ctypes.WinDLL(self._dll_path)
         except OSError as exc:
             raise RuntimeError(f"Failed to load ADL DLL: {exc}") from exc
 
-        self._adl_init()
+        ret = self._adl.ADL_Main_Control_Create(_adl_malloc, 1)
+        if ret != ADL_OK:
+            raise RuntimeError(f"ADL_Main_Control_Create failed: {ret}")
+
         self._adapter_index = self._find_asrock_adapter()
         if self._adapter_index is None:
-            raise RuntimeError(
-                "ASRock GPU (SubVendor 0x1849) not found on any AMD adapter"
-            )
+            raise RuntimeError("ASRock GPU (SubVendor 0x1849) not found on any AMD adapter")
 
     def close(self) -> None:
         if self._adl is not None:
@@ -122,7 +111,6 @@ class ASRockRGBController:
             self._adapter_index = None
 
     def set_color(self, r: int, g: int, b: int) -> None:
-        """Write static color to all RGB channels."""
         if self._adl is None or self._adapter_index is None:
             raise RuntimeError("Controller not open — call open() first")
         errors = []
@@ -135,13 +123,6 @@ class ASRockRGBController:
             raise RuntimeError("; ".join(errors))
 
     # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _adl_init(self) -> None:
-        ret = self._adl.ADL_Main_Control_Create(_adl_malloc, 1)
-        if ret != ADL_OK:
-            raise RuntimeError(f"ADL_Main_Control_Create failed: {ret}")
 
     def _find_asrock_adapter(self) -> "int | None":
         num = ctypes.c_int(0)
@@ -156,7 +137,6 @@ class ASRockRGBController:
         InfoArray = ADLAdapterInfo * count
         info_array = InfoArray()
         ctypes.memset(info_array, 0, ctypes.sizeof(info_array))
-        info_array[0].iSize = ctypes.sizeof(ADLAdapterInfo)
 
         ret = self._adl.ADL_Adapter_AdapterInfo_Get(
             ctypes.cast(info_array, ctypes.POINTER(ADLAdapterInfo)),
@@ -165,35 +145,36 @@ class ASRockRGBController:
         if ret != ADL_OK:
             raise RuntimeError(f"ADL_Adapter_AdapterInfo_Get failed: {ret}")
 
+        # First pass: look for ASRock subvendor
+        try:
+            fn = self._adl.ADL_Adapter_SubSystem_Get
+            for info in info_array:
+                if not info.iPresent:
+                    continue
+                sv = ctypes.c_int(0)
+                ss = ctypes.c_int(0)
+                if fn(info.iAdapterIndex, ctypes.byref(sv), ctypes.byref(ss)) == ADL_OK:
+                    if sv.value == ASROCK_SUBVENDOR:
+                        return info.iAdapterIndex
+        except AttributeError:
+            pass
+
+        # Fallback: PNP string contains "1849" (subvendor in hardware ID)
         for info in info_array:
-            if info.iPresent == 0:
+            if not info.iPresent:
                 continue
-            subvendor = self._get_subvendor(info.iAdapterIndex)
-            if subvendor == ASROCK_SUBVENDOR:
+            pnp = info.strPNPString.decode(errors="replace")
+            if "1849" in pnp:
+                return info.iAdapterIndex
+
+        # Last resort: first present adapter (single-GPU system)
+        for info in info_array:
+            if info.iPresent:
                 return info.iAdapterIndex
 
         return None
 
-    def _get_subvendor(self, adapter_index: int) -> int:
-        """Read SubVendorID via ADL_Adapter_ID_Get (returns iVendorID field)."""
-        # SubVendor not directly exposed by basic ADL; probe via PNP string or
-        # fall back to assuming first AMD adapter is the target when only one
-        # AMD GPU is present.  For robustness we check ADL_Adapter_SubSystem_Get
-        # if available, else return ASROCK_SUBVENDOR to accept any adapter.
-        try:
-            iSubVendorID = ctypes.c_int(0)
-            iSubSystemID = ctypes.c_int(0)
-            fn = self._adl.ADL_Adapter_SubSystem_Get
-            ret = fn(adapter_index, ctypes.byref(iSubVendorID), ctypes.byref(iSubSystemID))
-            if ret == ADL_OK:
-                return iSubVendorID.value
-        except AttributeError:
-            pass
-        # Fallback: accept first present adapter (single-GPU systems)
-        return ASROCK_SUBVENDOR
-
     def _write_channel(self, channel: int, r: int, g: int, b: int) -> None:
-        # mode=0x01 static, brightness=0xFF, speed=0x00, direction=0x00
         payload = bytes([0x01, r, g, b, 0xFF, 0x00, 0x00, 0x00])
         buf = ctypes.create_string_buffer(payload)
 
@@ -202,29 +183,23 @@ class ASRockRGBController:
         data.iLine = channel
         data.iAddress = RGB_I2C_ADDR
         data.iOffset = RGB_CMD
-        data.iAction = 2          # ADL_DL_I2C_ACTIONWRITE
+        data.iAction = 2       # ADL_DL_I2C_ACTIONWRITE
         data.iSpeed = 10
         data.iDataSize = len(payload)
         data.pcData = ctypes.cast(buf, ctypes.c_char_p)
 
-        ret = self._adl.ADL2_Display_WriteAndReadI2CRev_Get(
-            None, self._adapter_index, ctypes.byref(data)
+        ret = self._adl.ADL_Display_WriteAndReadI2C(
+            self._adapter_index, ctypes.byref(data)
         )
-        if ret != ADL_OK:
-            # Try the older non-ADL2 variant
-            ret = self._adl.ADL_Display_WriteAndReadI2C(
-                self._adapter_index, ctypes.byref(data)
-            )
         if ret != ADL_OK:
             raise RuntimeError(f"I2C write failed (ret={ret})")
 
 
 # ---------------------------------------------------------------------------
-# Convenience function for one-shot use
+# Convenience one-shot function
 # ---------------------------------------------------------------------------
 
 def apply_color(r: int, g: int, b: int, dll_path: str = DEFAULT_DLL_PATH) -> None:
-    """Open controller, write color, close. Raises on any failure."""
     ctrl = ASRockRGBController(dll_path)
     ctrl.open()
     try:
@@ -234,7 +209,6 @@ def apply_color(r: int, g: int, b: int, dll_path: str = DEFAULT_DLL_PATH) -> Non
 
 
 def load_config(config_path: str) -> dict:
-    """Load config.json; return defaults if missing or corrupt."""
     defaults = {"r": 255, "g": 255, "b": 255, "dll_path": DEFAULT_DLL_PATH}
     if not os.path.exists(config_path):
         return defaults
