@@ -12,8 +12,6 @@ ADL_OK = 0
 ADL_MAX_PATH = 256
 ASROCK_SUBVENDOR = "1849"
 RGB_I2C_ADDR = 0x36
-
-# Known discrete GPU PCI device IDs for ASRock RX 9070 XT
 DISCRETE_DEV_IDS = {"7550"}
 
 
@@ -62,35 +60,33 @@ def sep(char="-", n=60):
     print(char * n)
 
 
-def pnp_dev_id(pnp: str) -> str:
-    """Extract DEV_xxxx value from PNP string."""
-    for part in pnp.upper().split("&"):
-        if part.startswith("DEV_"):
-            return part[4:8]
-    return ""
+def i2c_write(adl, adapter: int, line: int, addr: int, offset: int, data: bytes) -> int:
+    buf = ctypes.create_string_buffer(data)
+    d = ADLI2CData()
+    d.iSize     = ctypes.sizeof(ADLI2CData)
+    d.iLine     = line
+    d.iAddress  = addr
+    d.iOffset   = offset
+    d.iAction   = 2       # WRITE
+    d.iSpeed    = 100
+    d.iDataSize = len(data)
+    d.pcData    = ctypes.cast(buf, ctypes.c_char_p)
+    return adl.ADL_Display_WriteAndReadI2C(adapter, ctypes.byref(d))
 
 
-def probe_i2c(adl, adapter_index: int, channel: int) -> tuple:
-    """Try read then write probe. Returns (ok: bool, detail: str)."""
-    for action, label in ((1, "READ"), (2, "WRITE")):
-        buf = ctypes.create_string_buffer(8)
-        if action == 2:
-            # Static white as test write — harmless
-            buf = ctypes.create_string_buffer(bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00]))
-        data = ADLI2CData()
-        data.iSize     = ctypes.sizeof(ADLI2CData)
-        data.iLine     = channel
-        data.iAddress  = RGB_I2C_ADDR
-        data.iOffset   = 0x10
-        data.iAction   = action
-        data.iSpeed    = 10
-        data.iDataSize = 8
-        data.pcData    = ctypes.cast(buf, ctypes.c_char_p)
-        ret = adl.ADL_Display_WriteAndReadI2C(adapter_index, ctypes.byref(data))
-        if ret == ADL_OK:
-            raw = buf.raw.hex(" ").upper()
-            return True, f"{label} OK — bytes: {raw}"
-    return False, f"ret={ret}"
+def i2c_read(adl, adapter: int, line: int, addr: int, offset: int, length: int = 8) -> tuple:
+    buf = ctypes.create_string_buffer(length)
+    d = ADLI2CData()
+    d.iSize     = ctypes.sizeof(ADLI2CData)
+    d.iLine     = line
+    d.iAddress  = addr
+    d.iOffset   = offset
+    d.iAction   = 1       # READ
+    d.iSpeed    = 100
+    d.iDataSize = length
+    d.pcData    = ctypes.cast(buf, ctypes.c_char_p)
+    ret = adl.ADL_Display_WriteAndReadI2C(adapter, ctypes.byref(d))
+    return ret, buf.raw
 
 
 def main():
@@ -99,27 +95,20 @@ def main():
     print("ASRock RX 9070 XT RGB — ADL Diagnostic")
     sep()
 
-    # 1. Load DLL
     print(f"[1] Loading DLL: {dll_path}")
     if not os.path.exists(dll_path):
-        print("    FAIL — file not found")
-        sys.exit(1)
+        print("    FAIL — file not found"); sys.exit(1)
     try:
         adl = ctypes.WinDLL(dll_path)
         print("    OK")
     except OSError as e:
-        print(f"    FAIL — {e}")
-        sys.exit(1)
+        print(f"    FAIL — {e}"); sys.exit(1)
 
-    # 2. Init ADL
     print("[2] ADL_Main_Control_Create …")
-    ret = adl.ADL_Main_Control_Create(_malloc, 1)
-    if ret != ADL_OK:
-        print(f"    FAIL (ret={ret})")
-        sys.exit(1)
+    if adl.ADL_Main_Control_Create(_malloc, 1) != ADL_OK:
+        print("    FAIL"); sys.exit(1)
     print("    OK")
 
-    # 3. Enumerate adapters
     print("[3] Enumerating AMD adapters …")
     num = ctypes.c_int(0)
     adl.ADL_Adapter_NumberOfAdapters_Get(ctypes.byref(num))
@@ -127,9 +116,7 @@ def main():
     print(f"    Adapter count: {count}")
 
     if count == 0:
-        print("    No adapters found — is AMD driver installed?")
-        adl.ADL_Main_Control_Destroy()
-        sys.exit(1)
+        print("    No adapters"); adl.ADL_Main_Control_Destroy(); sys.exit(1)
 
     InfoArray = ADLAdapterInfo * count
     info_array = InfoArray()
@@ -140,58 +127,71 @@ def main():
     )
 
     sep()
-
-    # Collect all ASRock adapters; prefer discrete GPU (DEV_7550) over iGPU
-    discrete_matches = []
-    all_matches = []
-
+    discrete = []
     for info in info_array:
         if not info.iPresent:
             continue
         name = info.strAdapterName.decode(errors="replace")
-        pnp  = info.strPNPString.decode(errors="replace")
-        dev  = pnp_dev_id(pnp)
-        is_asrock = ASROCK_SUBVENDOR in pnp.upper()
-        tag = " *** ASRock match ***" if is_asrock else ""
-        print(f"  Adapter {info.iAdapterIndex:2d}: {name}")
-        print(f"             DEV={dev}  PNP={pnp[:55]}{tag}")
-        if is_asrock:
-            all_matches.append(info.iAdapterIndex)
-            if dev in DISCRETE_DEV_IDS:
-                discrete_matches.append(info.iAdapterIndex)
+        pnp  = info.strPNPString.decode(errors="replace").upper()
+        dev  = next((p[4:8] for p in pnp.split("&") if p.startswith("DEV_")), "")
+        tag  = " *** ASRock ***" if ASROCK_SUBVENDOR in pnp else ""
+        print(f"  Adapter {info.iAdapterIndex:2d}: {name}  DEV={dev}{tag}")
+        if ASROCK_SUBVENDOR in pnp and dev in DISCRETE_DEV_IDS:
+            discrete.append(info.iAdapterIndex)
 
     sep()
 
-    # Prefer discrete; fall back to any ASRock match; last resort: first present
-    candidate_pool = discrete_matches if discrete_matches else all_matches
-    if not candidate_pool:
-        print("[!] No ASRock adapters found — trying all present adapters")
-        candidate_pool = [i.iAdapterIndex for i in info_array if i.iPresent]
+    # Use only the first discrete adapter for scanning — they're all the same physical GPU
+    if not discrete:
+        print("No discrete ASRock adapter found — aborting")
+        adl.ADL_Main_Control_Destroy(); sys.exit(1)
 
-    print(f"[4] Probing I2C (addr=0x{RGB_I2C_ADDR:02X}) on candidates: {candidate_pool}")
-    print(f"    {'discrete' if discrete_matches else 'all-asrock'} pool selected")
+    scan_adapter = discrete[0]
+    print(f"[4] Scanning adapter {scan_adapter} — I2C bus line sweep (lines 0-15)")
+    print(f"    Address 0x{RGB_I2C_ADDR:02X}, offset 0x10, write [0x01,0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x00]")
     sep()
 
-    found_adapter = None
-    for adapter_idx in candidate_pool:
-        print(f"  Adapter {adapter_idx}:")
-        for channel in [3, 6, 7]:
-            ok, detail = probe_i2c(adl, adapter_idx, channel)
-            status = "OK  " if ok else "FAIL"
-            print(f"    Channel {channel}: {status} — {detail}")
-            if ok and found_adapter is None:
-                found_adapter = adapter_idx
+    hits = []
+    test_payload = bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00])
+
+    for line in range(16):
+        ret = i2c_write(adl, scan_adapter, line, RGB_I2C_ADDR, 0x10, test_payload)
+        if ret == ADL_OK:
+            print(f"  Line {line:2d}: WRITE OK  *** controller may be here ***")
+            hits.append(line)
+        else:
+            # Also try read so we can distinguish "bus exists, no device" from "bus invalid"
+            rret, rdata = i2c_read(adl, scan_adapter, line, RGB_I2C_ADDR, 0x10)
+            if rret == ADL_OK:
+                print(f"  Line {line:2d}: READ  OK  data={rdata.hex(' ').upper()}  *** controller here ***")
+                hits.append(line)
+            else:
+                print(f"  Line {line:2d}: write ret={ret}  read ret={rret}")
+
+    sep()
+
+    # Also try alternate I2C address 0x6C (0x36 shifted left — some ADL variants expect 8-bit addr)
+    print(f"[5] Same scan with alternate address 0x6C (0x36 << 1) …")
+    sep()
+    for line in range(16):
+        ret = i2c_write(adl, scan_adapter, line, 0x6C, 0x10, test_payload)
+        if ret == ADL_OK:
+            print(f"  Line {line:2d} @ 0x6C: WRITE OK  *** try addr=0x6C ***")
+            hits.append(f"line={line},addr=0x6C")
 
     sep("=")
-    if found_adapter is not None:
-        print(f"RESULT: ASRock RGB controller FOUND on adapter {found_adapter}.")
-        print(f"        Use adapter_index={found_adapter} in config if needed.")
+    if hits:
+        print(f"RESULT: Responding lines: {hits}")
+        print("        Update RGB_I2C_ADDR / channel constants with these values.")
     else:
-        print("RESULT: I2C probe failed on all candidates.")
-        print("        Check: run as Administrator, AMD driver version.")
+        print("RESULT: No I2C response on any line 0-15 at either address.")
+        print("        Possible causes:")
+        print("          - ADL_Display_WriteAndReadI2C not the right function for this driver")
+        print("          - I2C access requires a specific initialisation sequence first")
+        print("          - Try with a display connected to the GPU (some drivers gate I2C on active output)")
 
     adl.ADL_Main_Control_Destroy()
-    sys.exit(0 if found_adapter is not None else 1)
+    sys.exit(0 if hits else 1)
 
 
 if __name__ == "__main__":
