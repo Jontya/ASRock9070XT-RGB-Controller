@@ -1,230 +1,152 @@
 """
-ADL I2C interface for ASRock RX 9070 XT Steel Legend RGB control.
-Calls atiadlxx.dll via ctypes. No third-party dependencies.
+ASRock RX 9070 XT Steel Legend — RGB controller via D3DKMTEscape.
+
+Protocol reverse-engineered from AsrPolychromeRGB.exe via Frida hook.
+Polychrome uses D3DKMTEscape (not ADL_Display_WriteAndReadI2C) to send
+I2C commands to the GPU's internal bus (line 2, address 0x6C, cmd 0x10).
+The escape buffer is 868 bytes; R/G/B sit at fixed offsets 255/256/257.
 """
 
 import ctypes
 import json
 import os
-import sys
+import struct
+
+DEFAULT_DLL_PATH = r"C:\Windows\System32\atiadlxx.dll"  # kept for config compat
 
 # ---------------------------------------------------------------------------
-# ADL constants
+# D3DKMT escape buffer template (868 bytes, captured from Polychrome)
+# Constant parts are set here; LUID (212-219) and RGB (255-257) patched at runtime
 # ---------------------------------------------------------------------------
 
-ADL_OK = 0
-ADL_MAX_PATH = 256
+_TEMPLATE_SIZE = 868
 
-ASROCK_SUBVENDOR = 0x1849
-RGB_I2C_ADDR = 0x6C  # 8-bit form of 7-bit addr 0x36 (ADL expects pre-shifted)
-RGB_CMD = 0x10
+def _build_template() -> bytearray:
+    buf = bytearray(_TEMPLATE_SIZE)
+    # Header
+    buf[0:8]     = bytes([0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00])
+    # Offset 72: total size field + flags
+    buf[72:92]   = bytes([0x64, 0x03, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+                          0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02,
+                          0x05, 0x00, 0x00, 0x00])
+    # Offset 204: sub-structure sizes
+    buf[204:212] = bytes([0x50, 0x01, 0x00, 0x00, 0x50, 0x01, 0x00, 0x00])
+    # Offset 212-219: LUID — patched per-adapter at runtime
+    # Offset 224: I2C command structure
+    buf[224:252] = bytes([0x40, 0x01, 0x00, 0x00,  # struct size
+                          0x04, 0x00, 0x00, 0x00,  # field
+                          0x02, 0x00, 0x00, 0x00,  # iLine = 2 (GPU internal I2C bus)
+                          0x6c, 0x00, 0x00, 0x00,  # iAddress = 0x6C
+                          0x10, 0x00, 0x00, 0x00,  # iOffset  = 0x10 (RGB command)
+                          0x64, 0x00, 0x00, 0x00,  # iSpeed   = 100
+                          0x0c, 0x00, 0x00, 0x00]) # iDataSize = 12
+    # Offset 252: I2C data payload prefix
+    buf[252:255] = bytes([0x00, 0x09, 0x11])
+    # Offset 255: R — patched at runtime
+    # Offset 256: G — patched at runtime
+    # Offset 257: B — patched at runtime
+    # Offset 258: constant suffix
+    buf[258:260] = bytes([0x8c, 0xff])
+    # Offset 540: trailing structure
+    buf[540:548] = bytes([0x40, 0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00])
+    return buf
 
-RGB_CHANNELS = [3, 6, 7]
-
-# PCI device IDs for discrete ASRock RX 9070 XT — prefer over iGPU adapters
-DISCRETE_DEV_IDS = {"7550"}
-
-DEFAULT_DLL_PATH = r"C:\Windows\System32\atiadlxx.dll"
+_TEMPLATE = _build_template()
 
 
 # ---------------------------------------------------------------------------
-# ADL structures — Windows layout only
+# D3DKMT ctypes structures (x64 layout)
 # ---------------------------------------------------------------------------
 
-class ADLAdapterInfo(ctypes.Structure):
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
+
+
+class _D3DKMT_ADAPTERINFO(ctypes.Structure):
     _fields_ = [
-        ("iSize",            ctypes.c_int),
-        ("iAdapterIndex",    ctypes.c_int),
-        ("strUDID",          ctypes.c_char * ADL_MAX_PATH),
-        ("iBusNumber",       ctypes.c_int),
-        ("iDeviceNumber",    ctypes.c_int),
-        ("iFunctionNumber",  ctypes.c_int),
-        ("iVendorID",        ctypes.c_int),
-        ("strAdapterName",   ctypes.c_char * ADL_MAX_PATH),
-        ("strDisplayName",   ctypes.c_char * ADL_MAX_PATH),
-        ("iPresent",         ctypes.c_int),
-        ("iExist",           ctypes.c_int),
-        ("strDriverPath",    ctypes.c_char * ADL_MAX_PATH),
-        ("strDriverPathExt", ctypes.c_char * ADL_MAX_PATH),
-        ("strPNPString",     ctypes.c_char * ADL_MAX_PATH),
-        ("iOSDisplayIndex",  ctypes.c_int),
+        ("hAdapter",                    ctypes.c_uint32),
+        ("AdapterLuid",                 _LUID),
+        ("NumOfSources",                ctypes.c_uint32),
+        ("bPresentMoveRegionsPreferred",ctypes.c_int32),
     ]
 
 
-class ADLI2CData(ctypes.Structure):
+class _D3DKMT_ENUMADAPTERS(ctypes.Structure):
     _fields_ = [
-        ("iSize",     ctypes.c_int),
-        ("iLine",     ctypes.c_int),
-        ("iAddress",  ctypes.c_int),
-        ("iOffset",   ctypes.c_int),
-        ("iAction",   ctypes.c_int),
-        ("iSpeed",    ctypes.c_int),
-        ("iDataSize", ctypes.c_int),
-        ("pcData",    ctypes.c_char_p),
+        ("NumAdapters", ctypes.c_uint32),
+        ("Adapters",    _D3DKMT_ADAPTERINFO * 16),
+    ]
+
+
+class _D3DKMT_ESCAPE(ctypes.Structure):
+    # x64: 4×uint32 (16 bytes) → void* at offset 16 (naturally 8-byte aligned)
+    _fields_ = [
+        ("hAdapter",             ctypes.c_uint32),
+        ("hDevice",              ctypes.c_uint32),
+        ("Type",                 ctypes.c_uint32),   # 0 = D3DKMT_ESCAPE_DRIVERPRIVATE
+        ("Flags",                ctypes.c_uint32),
+        ("pPrivateDriverData",   ctypes.c_void_p),
+        ("PrivateDriverDataSize",ctypes.c_uint32),
+        ("hContext",             ctypes.c_uint32),
     ]
 
 
 # ---------------------------------------------------------------------------
-# ADL memory allocation callback
+# Core: send escape to GPU
 # ---------------------------------------------------------------------------
 
-ADL_MAIN_MALLOC_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
+def _send_escape(r: int, g: int, b: int) -> None:
+    """Send one D3DKMTEscape call per enumerated adapter until one succeeds."""
+    gdi32 = ctypes.WinDLL("gdi32.dll")
 
+    enum_data = _D3DKMT_ENUMADAPTERS()
+    ret = gdi32.D3DKMTEnumAdapters(ctypes.byref(enum_data))
+    if ret != 0:
+        raise RuntimeError(f"D3DKMTEnumAdapters failed: 0x{ret & 0xFFFFFFFF:08X}")
 
-@ADL_MAIN_MALLOC_CALLBACK
-def _adl_malloc(size):
-    return ctypes.cast(ctypes.create_string_buffer(size), ctypes.c_void_p).value
+    last_ret = None
+    for i in range(enum_data.NumAdapters):
+        info = enum_data.Adapters[i]
 
+        buf = bytearray(_TEMPLATE)
+        # Patch LUID
+        struct.pack_into("<II", buf, 212,
+                         info.AdapterLuid.LowPart,
+                         info.AdapterLuid.HighPart & 0xFFFFFFFF)
+        # Patch RGB
+        buf[255] = r & 0xFF
+        buf[256] = g & 0xFF
+        buf[257] = b & 0xFF
 
-# ---------------------------------------------------------------------------
-# Controller class
-# ---------------------------------------------------------------------------
+        c_buf = ctypes.create_string_buffer(bytes(buf))
 
-class ASRockRGBController:
-    """Manages ADL initialisation and RGB channel writes."""
+        esc = _D3DKMT_ESCAPE()
+        esc.hAdapter              = info.hAdapter
+        esc.hDevice               = 0
+        esc.Type                  = 0   # D3DKMT_ESCAPE_DRIVERPRIVATE
+        esc.Flags                 = 0
+        esc.pPrivateDriverData    = ctypes.cast(c_buf, ctypes.c_void_p)
+        esc.PrivateDriverDataSize = _TEMPLATE_SIZE
+        esc.hContext              = 0
 
-    def __init__(self, dll_path: str = DEFAULT_DLL_PATH):
-        self._dll_path = dll_path
-        self._adl = None
-        self._adapter_index = None
+        ret = gdi32.D3DKMTEscape(ctypes.byref(esc))
+        if ret == 0:
+            return  # STATUS_SUCCESS
+        last_ret = ret
 
-    def open(self) -> None:
-        if not os.path.exists(self._dll_path):
-            raise FileNotFoundError(f"ADL DLL not found: {self._dll_path}")
-        try:
-            self._adl = ctypes.WinDLL(self._dll_path)
-        except OSError as exc:
-            raise RuntimeError(f"Failed to load ADL DLL: {exc}") from exc
-
-        ret = self._adl.ADL_Main_Control_Create(_adl_malloc, 1)
-        if ret != ADL_OK:
-            raise RuntimeError(f"ADL_Main_Control_Create failed: {ret}")
-
-        self._adapter_index = self._find_asrock_adapter()
-        if self._adapter_index is None:
-            raise RuntimeError("ASRock GPU (SubVendor 0x1849) not found on any AMD adapter")
-
-    def close(self) -> None:
-        if self._adl is not None:
-            try:
-                self._adl.ADL_Main_Control_Destroy()
-            except Exception:
-                pass
-            self._adl = None
-            self._adapter_index = None
-
-    def set_color(self, r: int, g: int, b: int) -> None:
-        if self._adl is None or self._adapter_index is None:
-            raise RuntimeError("Controller not open — call open() first")
-        errors = []
-        for ch in RGB_CHANNELS:
-            try:
-                self._write_channel(ch, r, g, b)
-            except Exception as exc:
-                errors.append(f"Channel {ch}: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
-
-    # ------------------------------------------------------------------
-
-    def _find_asrock_adapter(self) -> "int | None":
-        num = ctypes.c_int(0)
-        ret = self._adl.ADL_Adapter_NumberOfAdapters_Get(ctypes.byref(num))
-        if ret != ADL_OK:
-            raise RuntimeError(f"ADL_Adapter_NumberOfAdapters_Get failed: {ret}")
-
-        count = num.value
-        if count == 0:
-            return None
-
-        InfoArray = ADLAdapterInfo * count
-        info_array = InfoArray()
-        ctypes.memset(info_array, 0, ctypes.sizeof(info_array))
-
-        ret = self._adl.ADL_Adapter_AdapterInfo_Get(
-            ctypes.cast(info_array, ctypes.POINTER(ADLAdapterInfo)),
-            ctypes.sizeof(info_array),
-        )
-        if ret != ADL_OK:
-            raise RuntimeError(f"ADL_Adapter_AdapterInfo_Get failed: {ret}")
-
-        discrete_match = None
-        any_match = None
-
-        for info in info_array:
-            if not info.iPresent:
-                continue
-            pnp = info.strPNPString.decode(errors="replace").upper()
-            if "1849" not in pnp:
-                # Try ADL_Adapter_SubSystem_Get as secondary check
-                try:
-                    sv = ctypes.c_int(0)
-                    ss = ctypes.c_int(0)
-                    fn = self._adl.ADL_Adapter_SubSystem_Get
-                    if fn(info.iAdapterIndex, ctypes.byref(sv), ctypes.byref(ss)) == ADL_OK:
-                        if sv.value != ASROCK_SUBVENDOR:
-                            continue
-                    else:
-                        continue
-                except AttributeError:
-                    continue
-
-            # Prefer discrete GPU (DEV_7550) over iGPU
-            dev = ""
-            for part in pnp.split("&"):
-                if part.startswith("DEV_"):
-                    dev = part[4:8]
-                    break
-
-            if any_match is None:
-                any_match = info.iAdapterIndex
-            if discrete_match is None and dev in DISCRETE_DEV_IDS:
-                discrete_match = info.iAdapterIndex
-
-        if discrete_match is not None:
-            return discrete_match
-        if any_match is not None:
-            return any_match
-
-        # Last resort: first present adapter
-        for info in info_array:
-            if info.iPresent:
-                return info.iAdapterIndex
-
-        return None
-
-    def _write_channel(self, channel: int, r: int, g: int, b: int) -> None:
-        payload = bytes([0x01, r, g, b, 0xFF, 0x00, 0x00, 0x00])
-        buf = ctypes.create_string_buffer(payload)
-
-        data = ADLI2CData()
-        data.iSize = ctypes.sizeof(ADLI2CData)
-        data.iLine = channel
-        data.iAddress = RGB_I2C_ADDR
-        data.iOffset = RGB_CMD
-        data.iAction = 2       # ADL_DL_I2C_ACTIONWRITE
-        data.iSpeed = 10
-        data.iDataSize = len(payload)
-        data.pcData = ctypes.cast(buf, ctypes.c_char_p)
-
-        ret = self._adl.ADL_Display_WriteAndReadI2C(
-            self._adapter_index, ctypes.byref(data)
-        )
-        if ret != ADL_OK:
-            raise RuntimeError(f"I2C write failed (ret={ret})")
+    raise RuntimeError(
+        f"D3DKMTEscape failed on all {enum_data.NumAdapters} adapters; "
+        f"last NTSTATUS=0x{last_ret & 0xFFFFFFFF:08X}"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Convenience one-shot function
+# Public API (mirrors original adl_i2c interface)
 # ---------------------------------------------------------------------------
 
 def apply_color(r: int, g: int, b: int, dll_path: str = DEFAULT_DLL_PATH) -> None:
-    ctrl = ASRockRGBController(dll_path)
-    ctrl.open()
-    try:
-        ctrl.set_color(r, g, b)
-    finally:
-        ctrl.close()
+    """Apply static RGB color to all GPU LED zones. dll_path ignored (kept for compat)."""
+    _send_escape(r, g, b)
 
 
 def load_config(config_path: str) -> dict:
