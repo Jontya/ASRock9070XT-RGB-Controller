@@ -10,57 +10,65 @@ Usage (admin cmd, Polychrome must be running):
 import frida
 import sys
 
+# Handles both 32-bit and 64-bit Polychrome process.
+# D3DKMT_ESCAPE layout differs by pointer size.
 JS = """
-// D3DKMTEscape lives in gdi32.dll; the actual kernel thunk is in win32u.dll
-// Hook both to be sure.
-const targets = [
-    { mod: "gdi32.dll",    fn: "D3DKMTEscape"      },
-    { mod: "gdi32full.dll",fn: "D3DKMTEscape"      },
-    { mod: "win32u.dll",   fn: "NtGdiDdDDIEscape"  },
-];
+(function() {
+    const is64 = Process.pointerSize === 8;
 
-targets.forEach(({ mod, fn }) => {
-    const addr = Module.findExportByName(mod, fn);
-    if (!addr) return;
+    // D3DKMT_ESCAPE offsets
+    // x64: hAdapter(8) hDevice(8) Type(4) Flags(4) pData(8) Size(4)
+    // x86: hAdapter(4) hDevice(4) Type(4) Flags(4) pData(4) Size(4)
+    const OFF_TYPE  = is64 ? 0x10 : 0x08;
+    const OFF_FLAGS = is64 ? 0x14 : 0x0C;
+    const OFF_PDATA = is64 ? 0x18 : 0x10;
+    const OFF_SIZE  = is64 ? 0x20 : 0x14;
 
-    Interceptor.attach(addr, {
-        onEnter(args) {
-            // D3DKMT_ESCAPE struct pointer is args[0]
-            // Layout (x64):
-            //   +0x00  UINT64  hAdapter
-            //   +0x08  UINT64  hDevice
-            //   +0x10  UINT32  Type
-            //   +0x14  UINT32  Flags
-            //   +0x18  UINT64  pPrivateDriverData   <- pointer to payload
-            //   +0x20  UINT32  PrivateDriverDataSize
-            //   +0x24  UINT64  hContext (optional)
-            const pEscape = args[0];
-            try {
-                const type = pEscape.add(0x10).readU32();
-                const flags = pEscape.add(0x14).readU32();
-                const pData = pEscape.add(0x18).readPointer();
-                const size  = pEscape.add(0x20).readU32();
+    const targets = [
+        ["gdi32.dll",     "D3DKMTEscape"],
+        ["gdi32full.dll", "D3DKMTEscape"],
+        ["win32u.dll",    "NtGdiDdDDIEscape"],
+    ];
 
-                if (size === 0 || size > 4096) return; // skip noise
-
-                const bytes = Array.from(pData.readByteArray(size))
-                    .map(b => b.toString(16).padStart(2, "0"))
-                    .join(" ");
-
-                send({
-                    fn: fn,
-                    type: type,
-                    flags: flags,
-                    size: size,
-                    data: bytes,
-                });
-            } catch(e) {
-                // ignore unreadable memory
-            }
+    let hooked = 0;
+    targets.forEach(function(t) {
+        const mod = t[0], fn = t[1];
+        let addr = null;
+        try { addr = Module.findExportByName(mod, fn); } catch(e) {}
+        if (!addr) {
+            console.log("[-] Not found: " + mod + "!" + fn);
+            return;
+        }
+        try {
+            Interceptor.attach(addr, {
+                onEnter: function(args) {
+                    try {
+                        const pEscape = args[0];
+                        const type  = pEscape.add(OFF_TYPE).readU32();
+                        const flags = pEscape.add(OFF_FLAGS).readU32();
+                        const pData = pEscape.add(OFF_PDATA).readPointer();
+                        const size  = pEscape.add(OFF_SIZE).readU32();
+                        if (size === 0 || size > 4096) return;
+                        const raw = pData.readByteArray(size);
+                        const hex = Array.from(new Uint8Array(raw))
+                            .map(function(b){ return b.toString(16).padStart(2,"0"); })
+                            .join(" ");
+                        send({ fn: fn, type: type, flags: flags, size: size, data: hex });
+                    } catch(e) {
+                        console.log("[!] onEnter error: " + e.message);
+                    }
+                }
+            });
+            console.log("[+] Hooked " + mod + "!" + fn + " @ " + addr + " (arch=" + (is64?"x64":"x86") + ")");
+            hooked++;
+        } catch(e) {
+            console.log("[!] Attach failed for " + fn + ": " + e.message);
         }
     });
-    console.log("[+] Hooked " + mod + "!" + fn + " @ " + addr);
-});
+    if (hooked === 0) {
+        console.log("[!] No hooks placed — D3DKMTEscape not found in any target DLL");
+    }
+})();
 """
 
 
@@ -77,12 +85,13 @@ def on_message(message, _data):
         p = message["payload"]
         print(f"\n{'='*60}")
         print(f"Function : {p['fn']}")
-        print(f"EscType  : {p['type']} (0x{p['type']:08X})")
+        print(f"EscType  : 0x{p['type']:08X}")
         print(f"Flags    : {p['flags']}")
         print(f"DataSize : {p['size']} bytes")
         print(f"Data     : {p['data']}")
     elif message.get("type") == "error":
         print(f"[frida error] {message['description']}")
+        print(f"             {message.get('stack','')}")
 
 
 def main():
@@ -98,9 +107,8 @@ def main():
     script.on("message", on_message)
     script.load()
 
-    print("Hooks active. Change LED color in Polychrome now.")
-    print("Press Ctrl+C to stop.\n")
-    sys.stdin.read()
+    print("Hooks active. Change LED color in Polychrome, then press Enter to stop.\n")
+    input()
 
 
 if __name__ == "__main__":
