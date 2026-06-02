@@ -17,25 +17,39 @@ import frida, sys
 #   Total: 20 bytes
 JS = """
 (function() {
-    var gdi32 = Process.findModuleByName("gdi32.dll")
-             || Process.findModuleByName("GDI32.DLL");
-    if (!gdi32) { send({error: "gdi32.dll not loaded"}); return; }
-
+    // Scan all loaded modules for D3DKMT functions and list exports
+    var d3kmtExports = [];
     var fn_enum = null;
-    gdi32.enumerateExports().forEach(function(e) {
-        if (e.name === "D3DKMTEnumAdapters" || e.name === "D3DKMTEnumAdapters2") {
-            if (e.name === "D3DKMTEnumAdapters") fn_enum = e.address;
-        }
+    var fn_enum_module = null;
+
+    Process.enumerateModules().forEach(function(m) {
+        try {
+            m.enumerateExports().forEach(function(e) {
+                if (e.name.indexOf("D3DKMT") !== -1 || e.name.indexOf("d3dkmt") !== -1) {
+                    d3kmtExports.push(m.name + "!" + e.name);
+                    if (e.name === "D3DKMTEnumAdapters") {
+                        fn_enum = e.address;
+                        fn_enum_module = m.name;
+                    }
+                }
+            });
+        } catch(ex) {}
     });
-    if (!fn_enum) { send({error: "D3DKMTEnumAdapters not found in gdi32"}); return; }
+
+    send({d3kmt_exports: d3kmtExports});
+
+    if (!fn_enum) {
+        send({error: "D3DKMTEnumAdapters not found in any module"});
+        return;
+    }
+
+    send({info: "Found D3DKMTEnumAdapters in " + fn_enum_module});
 
     const D3DKMTEnumAdapters = new NativeFunction(fn_enum, 'int', ['pointer']);
-
-    // Allocate struct: UINT NumAdapters + 16 * D3DKMT_ADAPTERINFO(20 bytes each) = 4 + 320 = 324 bytes
     const ADAPTER_INFO_SIZE = 20;
     const MAX_ADAPTERS = 16;
     const buf = Memory.alloc(4 + MAX_ADAPTERS * ADAPTER_INFO_SIZE);
-    buf.writeU32(MAX_ADAPTERS);  // NumAdapters = max we can accept
+    buf.writeU32(MAX_ADAPTERS);
 
     const ret = D3DKMTEnumAdapters(buf);
     if (ret !== 0) {
@@ -47,10 +61,10 @@ JS = """
     var adapters = [];
     for (var i = 0; i < numAdapters; i++) {
         const base = buf.add(4 + i * ADAPTER_INFO_SIZE);
-        const hAdapter    = base.readU32();
-        const luidLow     = base.add(4).readU32();
-        const luidHigh    = base.add(8).readU32();
-        const numSources  = base.add(12).readU32();
+        const hAdapter   = base.readU32();
+        const luidLow    = base.add(4).readU32();
+        const luidHigh   = base.add(8).readU32();
+        const numSources = base.add(12).readU32();
         adapters.push({ idx: i, hAdapter: hAdapter, luidLow: luidLow, luidHigh: luidHigh, numSources: numSources });
     }
     send({adapters: adapters, count: numAdapters});
@@ -71,6 +85,12 @@ def on_message(message, _data):
         p = message["payload"]
         if "error" in p:
             print(f"ERROR: {p['error']}")
+        elif "info" in p:
+            print(f"INFO: {p['info']}")
+        elif "d3kmt_exports" in p:
+            print("D3DKMT exports found across all modules:")
+            for e in p["d3kmt_exports"]:
+                print(f"  {e}")
         else:
             print(f"Polychrome sees {p['count']} adapters:")
             for a in p["adapters"]:
