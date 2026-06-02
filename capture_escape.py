@@ -15,12 +15,16 @@ import sys
 JS = """
 (function() {
     const is64 = Process.pointerSize === 8;
-    // x86: hAdapter(4) hDevice(4) Type(4) Flags(4) pData(4) Size(4)
-    // x64: hAdapter(8) hDevice(8) Type(4) Flags(4) pData(8) Size(4)
-    const OFF_TYPE  = is64 ? 0x10 : 0x08;
-    const OFF_FLAGS = is64 ? 0x14 : 0x0C;
-    const OFF_PDATA = is64 ? 0x18 : 0x10;
-    const OFF_SIZE  = is64 ? 0x20 : 0x14;
+    // D3DKMT_ESCAPE layout:
+    //   x86: hAdapter(4) hDevice(4) Type(4) Flags(4) pData(4) Size(4) hContext(4)
+    //   x64: hAdapter(4) hDevice(4) Type(4) Flags(4) [pad4] pData(8) Size(4) hContext(4)
+    const OFF_HADAPTER = 0x00;
+    const OFF_HDEVICE  = 0x04;
+    const OFF_TYPE     = 0x08;
+    const OFF_FLAGS    = 0x0C;
+    const OFF_PDATA    = is64 ? 0x10 : 0x10;  // pointer after 4 uint32s; x64 has padding
+    const OFF_SIZE     = is64 ? 0x18 : 0x14;
+    const OFF_HCTX     = is64 ? 0x1C : 0x18;
 
     const HOOK_NAMES = ["D3DKMTEscape", "NtGdiDdDDIEscape"];
     let hooked = 0;
@@ -33,17 +37,23 @@ JS = """
                     Interceptor.attach(e.address, {
                         onEnter: function(args) {
                             try {
-                                const pEscape = args[0];
-                                const type  = pEscape.add(OFF_TYPE).readU32();
-                                const flags = pEscape.add(OFF_FLAGS).readU32();
-                                const pData = pEscape.add(OFF_PDATA).readPointer();
-                                const size  = pEscape.add(OFF_SIZE).readU32();
+                                const pEscape  = args[0];
+                                const hAdapter = pEscape.add(OFF_HADAPTER).readU32();
+                                const hDevice  = pEscape.add(OFF_HDEVICE).readU32();
+                                const type     = pEscape.add(OFF_TYPE).readU32();
+                                const flags    = pEscape.add(OFF_FLAGS).readU32();
+                                const pData    = pEscape.add(OFF_PDATA).readPointer();
+                                const size     = pEscape.add(OFF_SIZE).readU32();
+                                const hCtx     = pEscape.add(OFF_HCTX).readU32();
                                 if (size === 0 || size > 4096) return;
                                 const raw = pData.readByteArray(size);
                                 const hex = Array.from(new Uint8Array(raw))
                                     .map(function(b){ return b.toString(16).padStart(2,"0"); })
                                     .join(" ");
-                                send({ fn: m.name + "!" + e.name, type: type, flags: flags, size: size, data: hex });
+                                send({ fn: m.name + "!" + e.name,
+                                       hAdapter: hAdapter, hDevice: hDevice,
+                                       type: type, flags: flags,
+                                       size: size, hContext: hCtx, data: hex });
                             } catch(ex) {}
                         }
                     });
@@ -76,6 +86,9 @@ def on_message(message, _data):
         p = message["payload"]
         print(f"\n{'='*60}")
         print(f"Function : {p['fn']}")
+        print(f"hAdapter : 0x{p['hAdapter']:08X}")
+        print(f"hDevice  : 0x{p['hDevice']:08X}")
+        print(f"hContext : 0x{p['hContext']:08X}")
         print(f"EscType  : 0x{p['type']:08X}")
         print(f"Flags    : {p['flags']}")
         print(f"DataSize : {p['size']} bytes")
