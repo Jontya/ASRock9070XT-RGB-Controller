@@ -210,6 +210,13 @@ JS = r"""
                                     var pArr = ptr(this.pStruct.add(4).readU32());
                                     ev.adapters = dumpAdapterArray(pArr, count2);
                                 } catch(e) {}
+                            } else if (this.fn === "D3DKMTOpenAdapterFromHdc" && nts === 0) {
+                                // [0] hDc (in), [4] hAdapter (out), [8] LUID.LowPart, [12] LUID.HighPart, [16] VidPnSourceId
+                                try {
+                                    ev.hAdapter = this.pStruct.add(4).readU32();
+                                    ev.luidLow  = this.pStruct.add(8).readU32();
+                                    ev.luidHigh = this.pStruct.add(12).readU32();
+                                } catch(e) {}
                             } else if (this.fn === "D3DKMTCreateDevice" && nts === 0) {
                                 try { ev.hDevice = this.pStruct.readU32(); } catch(e) {}
                             }
@@ -265,25 +272,41 @@ def find_polychrome():
     return None
 
 
+POLYCHROME_PATH = r"C:\Program Files (x86)\ASRock Utility\ASRRGBLED\Bin\AsrPolychromeRGB.exe"
+
+
 def main():
     os.makedirs("captures", exist_ok=True)
     ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_path = os.path.join("captures", f"trace_{ts_str}.json")
     txt_path  = os.path.join("captures", f"trace_{ts_str}.txt")
 
-    print("Waiting for AsrPolychromeRGB.exe ...")
-    proc = None
-    while proc is None:
-        proc = find_polychrome()
-        if proc is None:
-            time.sleep(1)
-            sys.stdout.write(".")
-            sys.stdout.flush()
-    print(f"\nAttaching to {proc.name} (pid {proc.pid}) ...")
+    device = frida.get_local_device()
 
-    device  = frida.get_local_device()
-    session = device.attach(proc.pid)
-    script  = session.create_script(JS)
+    # Prefer spawn so we catch startup adapter-open calls.
+    # Falls back to attach if process already running.
+    spawn_path = POLYCHROME_PATH if os.path.exists(POLYCHROME_PATH) else None
+    proc = find_polychrome()
+
+    if spawn_path and proc is None:
+        print(f"Spawning {spawn_path} ...")
+        pid = device.spawn([spawn_path])
+        session = device.attach(pid)
+        script  = session.create_script(JS)
+        print("Hooks loaded — resuming process ...")
+    else:
+        if proc is None:
+            print("Waiting for AsrPolychromeRGB.exe (spawn path not found, attach mode) ...")
+            while proc is None:
+                proc = find_polychrome()
+                if proc is None:
+                    time.sleep(1)
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
+        print(f"\nAttaching to {proc.name} (pid {proc.pid}) ...")
+        pid = None
+        session = device.attach(proc.pid)
+        script  = session.create_script(JS)
 
     events  = []
     pending = {}
@@ -335,12 +358,18 @@ def main():
             if "adapters" in ev:
                 for a in ev["adapters"]:
                     extra += f"\n    hAdapter=0x{a['hAdapter']:08X}  LUID=0x{a['luidLow']:08X}"
+        elif fn == "D3DKMTOpenAdapterFromHdc":
+            if nts == 0:
+                extra = f"  hAdapter=0x{ev.get('hAdapter',0):08X}  LUID=0x{ev.get('luidLow',0):08X}"
         elif fn == "D3DKMTCloseAdapter":
             extra = f"  hAdapter=0x{h:08X}"
         print(f"  [{seq:>4}] {fn}{extra}{nts_s}")
 
     script.on("message", on_message)
     script.load()
+    if pid is not None:
+        device.resume(pid)
+        print("Process resumed. Wait for Polychrome UI to appear.")
     print("\nReady. Now:")
     print("  1. Let Polychrome fully load (UI visible).")
     print("  2. Change one color (e.g. to red).")
