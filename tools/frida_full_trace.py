@@ -36,14 +36,22 @@ JS = r"""
         "NtGdiDdDDIEscape",
         "D3DKMTQueryAdapterInfo",
         "D3DKMTOpenAdapterFromGdiDisplayName",
+        "NtGdiDdDDIOpenAdapterFromGdiDisplayName",
         "D3DKMTOpenAdapterFromHdc",
+        "NtGdiDdDDIOpenAdapterFromHdc",
         "D3DKMTOpenAdapterFromDeviceName",
+        "NtGdiDdDDIOpenAdapterFromDeviceName",
         "D3DKMTOpenAdapterFromLuid",
+        "NtGdiDdDDIOpenAdapterFromLuid",
         "D3DKMTCreateDevice",
+        "NtGdiDdDDICreateDevice",
         "D3DKMTDestroyDevice",
         "D3DKMTCloseAdapter",
+        "NtGdiDdDDICloseAdapter",
         "D3DKMTEnumAdapters",
+        "NtGdiDdDDIEnumAdapters",
         "D3DKMTEnumAdapters2",
+        "NtGdiDdDDIEnumAdapters2",
     ];
 
     function hexOf(ptr, len) {
@@ -114,12 +122,15 @@ JS = r"""
                 var fnName  = exp.name;
                 var modName = mod.name;
                 var isEscape  = (fnName === "D3DKMTEscape" || fnName === "NtGdiDdDDIEscape");
-                var isQuery   = (fnName === "D3DKMTQueryAdapterInfo");
-                var isOpenGdi = (fnName === "D3DKMTOpenAdapterFromGdiDisplayName");
-                var isOpenDev = (fnName === "D3DKMTOpenAdapterFromDeviceName");
-                var isOpenLuid= (fnName === "D3DKMTOpenAdapterFromLuid");
-                var isEnum    = (fnName === "D3DKMTEnumAdapters");
-                var isEnum2   = (fnName === "D3DKMTEnumAdapters2");
+                var isQuery   = (fnName === "D3DKMTQueryAdapterInfo" || fnName === "NtGdiDdDDIQueryAdapterInfo");
+                var isOpenGdi = (fnName === "D3DKMTOpenAdapterFromGdiDisplayName" || fnName === "NtGdiDdDDIOpenAdapterFromGdiDisplayName");
+                var isOpenHdc = (fnName === "D3DKMTOpenAdapterFromHdc" || fnName === "NtGdiDdDDIOpenAdapterFromHdc");
+                var isOpenDev = (fnName === "D3DKMTOpenAdapterFromDeviceName" || fnName === "NtGdiDdDDIOpenAdapterFromDeviceName");
+                var isOpenLuid= (fnName === "D3DKMTOpenAdapterFromLuid" || fnName === "NtGdiDdDDIOpenAdapterFromLuid");
+                var isEnum    = (fnName === "D3DKMTEnumAdapters" || fnName === "NtGdiDdDDIEnumAdapters");
+                var isEnum2   = (fnName === "D3DKMTEnumAdapters2" || fnName === "NtGdiDdDDIEnumAdapters2");
+                var isCreate  = (fnName === "D3DKMTCreateDevice" || fnName === "NtGdiDdDDICreateDevice");
+                var isClose   = (fnName === "D3DKMTCloseAdapter" || fnName === "NtGdiDdDDICloseAdapter");
 
                 try {
                     Interceptor.attach(exp.address, {
@@ -152,6 +163,8 @@ JS = r"""
                                 ev.hAdapter = s.hAdapter; ev.Type = s.Type; ev.DataSize = s.DataSize;
                             } else if (isOpenGdi) {
                                 try { ev.devName = this.pStruct.readUtf16String(); } catch(e) { ev.devName = "err:" + e.message; }
+                            } else if (isOpenHdc) {
+                                try { ev.hDc = this.pStruct.readU32(); } catch(e) {}
                             } else if (isOpenDev) {
                                 // [0] pDeviceName (PCWSTR pointer, 4 bytes in 32-bit)
                                 try {
@@ -161,9 +174,9 @@ JS = r"""
                             } else if (isOpenLuid) {
                                 // [0] LUID.LowPart, [4] LUID.HighPart (input)
                                 try { ev.luidLow = this.pStruct.readU32(); ev.luidHigh = this.pStruct.add(4).readU32(); } catch(e) {}
-                            } else if (fnName === "D3DKMTCreateDevice") {
+                            } else if (isCreate) {
                                 try { ev.hAdapter = this.pStruct.readU32(); } catch(e) {}
-                            } else if (fnName === "D3DKMTCloseAdapter") {
+                            } else if (isClose) {
                                 try { ev.hAdapter = this.pStruct.readU32(); } catch(e) {}
                             }
 
@@ -210,14 +223,14 @@ JS = r"""
                                     var pArr = ptr(this.pStruct.add(4).readU32());
                                     ev.adapters = dumpAdapterArray(pArr, count2);
                                 } catch(e) {}
-                            } else if (this.fn === "D3DKMTOpenAdapterFromHdc" && nts === 0) {
-                                // [0] hDc (in), [4] hAdapter (out), [8] LUID.LowPart, [12] LUID.HighPart, [16] VidPnSourceId
+                            } else if (isOpenHdc && nts === 0) {
+                                // [0] hDc (in), [4] hAdapter (out), [8] LUID.LowPart, [12] LUID.HighPart
                                 try {
                                     ev.hAdapter = this.pStruct.add(4).readU32();
                                     ev.luidLow  = this.pStruct.add(8).readU32();
                                     ev.luidHigh = this.pStruct.add(12).readU32();
                                 } catch(e) {}
-                            } else if (this.fn === "D3DKMTCreateDevice" && nts === 0) {
+                            } else if (isCreate && nts === 0) {
                                 try { ev.hDevice = this.pStruct.readU32(); } catch(e) {}
                             }
 
@@ -346,22 +359,24 @@ def main():
             ds = ev.get("DataSize", 0)
             extra = f"  hAdapter=0x{h:08X}  DataSize={ds}"
             if ev.get("isI2C"): extra += "  *** I2C ***"
-        elif fn in ("D3DKMTOpenAdapterFromGdiDisplayName", "D3DKMTOpenAdapterFromDeviceName"):
+        elif fn in ("D3DKMTOpenAdapterFromGdiDisplayName", "NtGdiDdDDIOpenAdapterFromGdiDisplayName",
+                    "D3DKMTOpenAdapterFromDeviceName", "NtGdiDdDDIOpenAdapterFromDeviceName"):
             extra = f"  devName={ev.get('devName','?')!r}"
             if nts == 0:
                 extra += f"  hAdapter=0x{ev.get('hAdapter',0):08X}  LUID=0x{ev.get('luidLow',0):08X}"
         elif fn == "D3DKMTOpenAdapterFromLuid":
             extra = f"  LUID=0x{ev.get('luidLow',0):08X}"
             if nts == 0: extra += f"  hAdapter=0x{ev.get('hAdapter',0):08X}"
-        elif fn in ("D3DKMTEnumAdapters", "D3DKMTEnumAdapters2"):
+        elif fn in ("D3DKMTEnumAdapters", "NtGdiDdDDIEnumAdapters",
+                    "D3DKMTEnumAdapters2", "NtGdiDdDDIEnumAdapters2"):
             extra = f"  numAdapters={ev.get('numAdapters','?')}"
             if "adapters" in ev:
                 for a in ev["adapters"]:
                     extra += f"\n    hAdapter=0x{a['hAdapter']:08X}  LUID=0x{a['luidLow']:08X}"
-        elif fn == "D3DKMTOpenAdapterFromHdc":
+        elif fn in ("D3DKMTOpenAdapterFromHdc", "NtGdiDdDDIOpenAdapterFromHdc"):
             if nts == 0:
                 extra = f"  hAdapter=0x{ev.get('hAdapter',0):08X}  LUID=0x{ev.get('luidLow',0):08X}"
-        elif fn == "D3DKMTCloseAdapter":
+        elif fn in ("D3DKMTCloseAdapter", "NtGdiDdDDICloseAdapter"):
             extra = f"  hAdapter=0x{h:08X}"
         print(f"  [{seq:>4}] {fn}{extra}{nts_s}")
 
@@ -418,21 +433,31 @@ def _write_txt(path, events):
 def _analyze(events):
     print("\n" + "="*60 + "\nANALYSIS\n" + "="*60)
     print("\nAdapter open calls:")
+    open_fns = {
+        "D3DKMTOpenAdapterFromGdiDisplayName", "NtGdiDdDDIOpenAdapterFromGdiDisplayName",
+        "D3DKMTOpenAdapterFromDeviceName", "NtGdiDdDDIOpenAdapterFromDeviceName",
+        "D3DKMTOpenAdapterFromLuid", "NtGdiDdDDIOpenAdapterFromLuid",
+        "D3DKMTOpenAdapterFromHdc", "NtGdiDdDDIOpenAdapterFromHdc",
+    }
     for ev in events:
         fn = ev.get("fn", "")
-        if fn in ("D3DKMTOpenAdapterFromGdiDisplayName", "D3DKMTOpenAdapterFromDeviceName", "D3DKMTOpenAdapterFromLuid"):
-            nts = ev.get("nts", -1)
-            h   = ev.get("hAdapter", 0)
-            ll  = ev.get("luidLow", 0)
-            dev = ev.get("devName", "?")
-            if fn == "D3DKMTOpenAdapterFromLuid":
-                print(f"  [Luid] LUID=0x{ll:08X}  hAdapter=0x{h:08X}  {nts_str(nts)}")
-            else:
-                print(f"  [Open] {dev!r}  hAdapter=0x{h:08X}  {nts_str(nts)}")
+        if fn not in open_fns:
+            continue
+        nts = ev.get("nts", -1)
+        h   = ev.get("hAdapter", 0)
+        ll  = ev.get("luidLow", 0)
+        dev = ev.get("devName", "?")
+        if "Luid" in fn:
+            print(f"  [Luid] LUID=0x{ll:08X}  hAdapter=0x{h:08X}  {nts_str(nts)}")
+        elif "Hdc" in fn:
+            print(f"  [Hdc]  hAdapter=0x{h:08X}  LUID=0x{ll:08X}  {nts_str(nts)}")
+        else:
+            print(f"  [Open] {dev!r}  hAdapter=0x{h:08X}  {nts_str(nts)}")
     print("\nEnumAdapters results:")
+    enum_fns = {"D3DKMTEnumAdapters","NtGdiDdDDIEnumAdapters","D3DKMTEnumAdapters2","NtGdiDdDDIEnumAdapters2"}
     for ev in events:
         fn = ev.get("fn", "")
-        if fn in ("D3DKMTEnumAdapters", "D3DKMTEnumAdapters2") and "adapters" in ev:
+        if fn in enum_fns and "adapters" in ev:
             print(f"  {fn}: {ev['numAdapters']} adapter(s)")
             for a in ev["adapters"]:
                 print(f"    hAdapter=0x{a['hAdapter']:08X}  LUID=0x{a['luidLow']:08X}")
